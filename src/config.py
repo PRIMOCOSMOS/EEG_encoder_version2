@@ -18,7 +18,7 @@ PREPROCESS_DEFAULTS: Dict[str, object] = {
     "max_windows_per_trial": 60,     # 防长视频主导：每 clip 至多 N 个窗口（居中截取）
     "use_car": True,                 # 平均参考
     "use_baseline_correct": True,    # 基线去均值（默认用整段均值，避免依赖额外baseline段）
-    "use_ica": False,                # ICA 较慢，默认关闭（如开启建议线下做一次）
+    "use_ica": True,                # ICA 较慢，默认关闭（如开启建议线下做一次）
     "ica_components": 20,
     "ica_remove": 5,
     "per_channel_zscore": True,      # 按通道 z-score（优先方案）
