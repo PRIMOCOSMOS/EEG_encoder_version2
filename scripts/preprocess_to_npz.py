@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Stream-preprocess SEED-VII into a single npz.
 
-输入源（互斥）：
-    A) --volumes-dir  本地分卷目录
-    B) --ms-dataset   ModelScope 数据集（实例无法挂载时用，按需「一卷下载-一处理-一删」）
+输入源（三选一，按优先顺序）：
+    C) --ms-single-zip   ModelScope 上**已合并的单一 zip**（推荐；零落盘，HTTP Range 流式）
+                         需先用 `scripts/merge_and_upload.py` 完成合并+上传
+    B) --ms-dataset      ModelScope 上的**多分卷**（按需"一卷下载-一处理-一删"）
+    A) --volumes-dir     本地分卷目录
 
 严格执行 Design.md：
     1) **流式** 从分卷 zip 中按需读取每个 subject 的 .mat（处理完立即释放）。
@@ -35,6 +37,7 @@ from src.config import PREPROCESS_DEFAULTS, TRAIN_DEFAULTS  # noqa: E402
 from src.dataset import (  # noqa: E402
     TrialKey,
     iter_trials_from_modelscope,
+    iter_trials_from_modelscope_single_file,
     iter_trials_from_zip,
     load_save_info_intensity,
     save_dataset_npz,
@@ -48,7 +51,8 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Stream-preprocess SEED-VII (local volumes OR ModelScope) to npz")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--volumes-dir", help="Local directory of split volumes")
-    src.add_argument("--ms-dataset", help="ModelScope dataset id (e.g. DEREKVERSE/SEED-VII)")
+    src.add_argument("--ms-dataset", help="ModelScope dataset id (multi-volume mode)")
+    src.add_argument("--ms-single-zip", help="ModelScope dataset id (single merged zip mode; see --ms-single-zip-path)")
     ap.add_argument("--pattern", default="*.zip.*",
                     help="Glob for split volumes inside the source (default: *.zip.*)")
     ap.add_argument("--ms-revision", default="master")
@@ -57,6 +61,14 @@ def parse_args():
                     help="Where to cache downloaded volumes during streaming")
     ap.add_argument("--ms-max-resident-volumes", type=int, default=2,
                     help="How many split volumes are allowed on disk simultaneously")
+
+    # Single-merged-zip mode (C)
+    ap.add_argument("--ms-single-zip-path", default="SEED-VII.zip",
+                    help="Path of the merged zip inside the dataset (default: SEED-VII.zip)")
+    ap.add_argument("--ms-range-cache-mb", type=int, default=256,
+                    help="In-memory LRU range cache size when reading the merged zip (MB)")
+    ap.add_argument("--ms-range-chunk-mb", type=int, default=8,
+                    help="HTTP Range GET chunk size when reading the merged zip (MB)")
 
     # save_info
     ap.add_argument("--save-info-dir", default="",
@@ -92,7 +104,20 @@ def parse_args():
 def _make_iter(args):
     """Factory returning a function `() -> iterator of RawTrial` for two passes."""
     only = list(args.only_subjects.split(",")) if args.only_subjects else None
-    if args.volumes_dir:
+    if args.ms_single_zip:
+        def _it():
+            return iter_trials_from_modelscope_single_file(
+                dataset_id=args.ms_single_zip,
+                path_in_repo=args.ms_single_zip_path,
+                revision=args.ms_revision,
+                token=(args.ms_token or None),
+                subdir_keyword=args.subdir_keyword,
+                only_subjects=only,
+                cache_mb=args.ms_range_cache_mb,
+                chunk_mb=args.ms_range_chunk_mb,
+            )
+        return _it
+    elif args.volumes_dir:
         def _it():
             return iter_trials_from_zip(
                 args.volumes_dir, pattern=args.pattern,
@@ -118,11 +143,12 @@ def _make_iter(args):
 def _resolve_save_info_dir(args) -> str:
     if args.save_info_dir:
         return args.save_info_dir
-    if args.ms_dataset and args.ms_save_info_include:
+    ms_ds = args.ms_single_zip or args.ms_dataset
+    if ms_ds and args.ms_save_info_include:
         from src.ms_download import download_save_info
         local = Path(args.ms_scratch_dir) / "save_info"
         download_save_info(
-            dataset_id=args.ms_dataset,
+            dataset_id=ms_ds,
             local_dir=str(local),
             revision=args.ms_revision,
             token=(args.ms_token or None),

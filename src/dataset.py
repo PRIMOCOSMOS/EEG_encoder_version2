@@ -30,8 +30,12 @@ from .labels import (
 from .zip_stream import (
     extract_mat_bytes,
     iter_mat_members,
+    locate_members_in_stream,
     open_concat_zip,
     open_remote_concat_zip,
+    schedule_members_by_part,
+    volume_sort_key,
+    LazyConcatStream,
 )
 
 
@@ -166,26 +170,69 @@ def _iter_trials_from_zipfile(
     zf,
     subdir_keyword: str = "EEG_preprocessed",
     only_subjects: Optional[Sequence[str]] = None,
+    stream: Optional[LazyConcatStream] = None,
 ) -> Iterator[RawTrial]:
-    """Core: given an opened ZipFile, iterate (subject, session, trial, eeg) records."""
+    """Core: given an opened ZipFile, iterate (subject, session, trial, eeg) records.
+
+    If `stream` is a LazyConcatStream, we schedule the read order by **volume index**
+    so the LRU pulls each split volume in at most twice in the worst case (once for the
+    main bulk + once if a neighboring mat straddles the boundary), instead of bouncing
+    around. This makes the wall-clock cost ≈ "download each volume once, sequentially".
+    """
     members = list(iter_mat_members(zf, subdir_keyword=subdir_keyword))
     if only_subjects:
         wanted = set(map(str, only_subjects))
         members = [m for m in members if Path(m.filename).stem in wanted]
-    members.sort(key=lambda m: _natural_key(Path(m.filename).stem))
-    for info in members:
+
+    if stream is not None:
+        # Schedule by physical layout in the concat stream (monotonic volume traversal)
+        locales = locate_members_in_stream(zf, members, stream)
+        locales = schedule_members_by_part(locales)
+        ordered = [loc.info for loc in locales]
+    else:
+        # Logical sort by subject filename (e.g. "1".."20")
+        members.sort(key=lambda m: _natural_key(Path(m.filename).stem))
+        ordered = members
+        locales = None
+
+    for k, info in enumerate(ordered):
         subject = Path(info.filename).stem  # "1".."20"
-        raw_bytes = extract_mat_bytes(zf, info)
+
+        # If this member straddles a volume boundary, temporarily pin the END
+        # volume so the LRU doesn't evict it before we finish reading.
+        pinned_extra: Optional[int] = None
+        if stream is not None and locales is not None:
+            loc = locales[k]
+            if loc.end_part != loc.start_part:
+                # pin the end volume (start volume is current and is auto-protected
+                # by `_maybe_evict()`'s "don't evict current" rule)
+                try:
+                    stream.pin(loc.end_part, fetch_now=False)
+                    pinned_extra = loc.end_part
+                except Exception:
+                    pinned_extra = None
+
+        try:
+            raw_bytes = extract_mat_bytes(zf, info)
+        finally:
+            if pinned_extra is not None:
+                # release the temporary pin (but keep file resident; it becomes
+                # LRU-evictable from here on).
+                try:
+                    stream.unpin(pinned_extra, evict_now=False)
+                except Exception:
+                    pass
+
         data = loadmat(
             io.BytesIO(raw_bytes),
             verify_compressed_data_integrity=False,
         )
         fields = []
-        for k in data.keys():
-            if k.startswith("__"):
+        for key in data.keys():
+            if key.startswith("__"):
                 continue
-            if k.isdigit():
-                fields.append((int(k), k))
+            if key.isdigit():
+                fields.append((int(key), key))
         fields.sort(key=lambda t: t[0])
         del raw_bytes  # free as early as possible
         for fid, name in fields:
@@ -219,7 +266,17 @@ def iter_trials_from_zip(
             zf, subdir_keyword=subdir_keyword, only_subjects=only_subjects,
         )
     finally:
-        zf.close()
+        # close the zipfile and the underlying ConcatStream
+        try:
+            inner = zf.fp
+        except Exception:
+            inner = None
+        try:
+            zf.close()
+        finally:
+            if inner is not None:
+                try: inner.close()
+                except Exception: pass
 
 
 def iter_trials_from_modelscope(
@@ -234,17 +291,24 @@ def iter_trials_from_modelscope(
 ) -> Iterator[RawTrial]:
     """Stream trials directly from a ModelScope dataset (no manual download step).
 
-    Internally:
-      1) List & sort the remote split volumes by trailing digits.
-      2) Build a `LazyConcatStream` that downloads each volume only when its bytes
-         are needed and evicts the oldest one once we hold more than `max_resident_volumes`.
-      3) Hand the stream to `zipfile.ZipFile` and reuse the existing per-trial iterator.
+    User volumes are **byte-level splits** of the original zip (`split -b ...` style),
+    not zip-native spanning archives. Their byte-concatenation == one valid ZIP64.
 
-    Disk footprint: at most `max_resident_volumes` × 5.37GB (default 2 → ≤ ~11GB), no matter
-    how big the dataset is in total.
+    Internally:
+      1) List & sort the remote split volumes by the volume's trailing-digit index.
+      2) Build a `LazyConcatStream` that downloads each volume only when its bytes
+         are needed, evicts non-pinned ones with LRU, and **pre-pins the LAST volume**
+         so opening `zipfile.ZipFile(...)` (which seeks to end to find EOCD/central
+         directory) does not trigger a "download-then-evict" cycle on every open.
+      3) Schedule mat reads in volume-order so the LRU pulls each volume in once.
+
+    Disk footprint at any instant:
+        1 pinned last-volume + max_resident_volumes LRU-live + 1 currently-open
+        ≈ (2 + max_resident_volumes) × 5.37GB. Default → ≤ ~21GB.
+        After the central-directory scan you can call `stream.unpin(N-1)` to drop
+        it back to ≈ (1 + max_resident_volumes) volumes.
     """
     from .ms_download import (
-        discover_remote_volumes,
         download_one_file,
         list_dataset_files,
         login_if_token,
@@ -254,22 +318,11 @@ def iter_trials_from_modelscope(
 
     # 1) discover & get sizes
     listing = list_dataset_files(dataset_id, revision=revision, token=token)
-    # filter by glob
     import fnmatch as _fn
     listing = [f for f in listing if _fn.fnmatch(f.get("Path", ""), pattern)]
     if not listing:
         raise RuntimeError(f"No remote volumes matched {pattern} in {dataset_id}")
-
-    def _digit_key(name: str):
-        digits = ""
-        for ch in reversed(name):
-            if ch.isdigit():
-                digits = ch + digits
-            else:
-                if digits:
-                    break
-        return (int(digits) if digits else 0, name)
-    listing.sort(key=lambda f: _digit_key(f.get("Path", "")))
+    listing.sort(key=lambda f: volume_sort_key(f.get("Path", "")))
 
     sizes_in_order = [(f["Path"], int(f.get("Size", 0) or 0)) for f in listing]
     missing_sizes = [n for n, s in sizes_in_order if s <= 0]
@@ -294,18 +347,78 @@ def iter_trials_from_modelscope(
         except Exception:
             pass
 
-    zf = open_remote_concat_zip(
+    zf, stream = open_remote_concat_zip(
         sizes_in_order=sizes_in_order,
         fetcher=_fetch,
         evicter=_evict,
         max_resident=max_resident_volumes,
+        pin_last=True,
+        warmup_last=True,
     )
     try:
         yield from _iter_trials_from_zipfile(
-            zf, subdir_keyword=subdir_keyword, only_subjects=only_subjects,
+            zf,
+            subdir_keyword=subdir_keyword,
+            only_subjects=only_subjects,
+            stream=stream,
         )
     finally:
-        zf.close()
+        try:
+            zf.close()
+        finally:
+            # zipfile.ZipFile does not close a file-like passed in; we must do it
+            # ourselves to trigger our scratch cleanup of pinned/LRU volumes.
+            stream.close()
+
+
+def iter_trials_from_modelscope_single_file(
+    dataset_id: str,
+    path_in_repo: str = "SEED-VII.zip",
+    revision: str = "master",
+    token: Optional[str] = None,
+    subdir_keyword: str = "EEG_preprocessed",
+    only_subjects: Optional[Sequence[str]] = None,
+    cache_mb: int = 256,
+    chunk_mb: int = 8,
+) -> Iterator[RawTrial]:
+    """Stream trials directly from a SINGLE merged zip living on ModelScope.
+
+    Uses HTTP Range requests against the dataset's pre-signed OSS URL.
+    **Disk usage = 0 bytes** (memory cache only, default ≤256 MB).
+
+    This is the preferred path AFTER `scripts/merge_and_upload.py` has produced
+    the unified `path_in_repo` (e.g. ``SEED-VII.zip``).
+
+    Args:
+        path_in_repo: target file inside the dataset, e.g. ``SEED-VII.zip``
+        cache_mb:     in-memory LRU range-cache size (default 256 MB)
+        chunk_mb:     size of each Range GET request (default 8 MB)
+    """
+    import zipfile
+    from .remote_range import open_dataset_file_as_range_stream
+
+    stream = open_dataset_file_as_range_stream(
+        dataset_id=dataset_id,
+        path_in_repo=path_in_repo,
+        revision=revision,
+        token=token,
+        chunk_size=chunk_mb * 1024 * 1024,
+        cache_bytes=cache_mb * 1024 * 1024,
+    )
+    zf = zipfile.ZipFile(stream, mode="r")
+    try:
+        # No need for the volume-ordered scheduler — single zip, single source.
+        yield from _iter_trials_from_zipfile(
+            zf, subdir_keyword=subdir_keyword, only_subjects=only_subjects,
+            stream=None,
+        )
+    finally:
+        try:
+            zf.close()
+        finally:
+            try: stream.close()
+            except Exception: pass
+
 
 
 def _natural_key(name: str) -> Tuple[int, str]:
