@@ -1,0 +1,45 @@
+# Optional YAML overrides for non-CLI users (not auto-loaded; just a reference).
+preprocess:
+  fs: 200
+  window_seconds: 4.0
+  step_seconds: 2.0
+  middle_ratio: 0.6
+  max_windows_per_trial: 60
+  per_channel_zscore: true
+  use_car: true
+  use_ica: false
+
+model:
+  n_channels: 62
+  n_timepoints: 800
+  n_classes: 7
+  embed_dim: 40
+  transformer_layers: 6
+  transformer_heads: 10
+  ffn_dim: 160
+  head_hidden: 256
+  dropout: 0.5
+  intensity_head_hidden: 64
+
+train:
+  batch_size: 64
+  lr: 2.0e-4
+  min_lr: 1.0e-5
+  pretrain_epochs: 10
+  max_epochs: 200
+  patience: 30
+  alpha_cls: 1.0
+  beta_reg: 0.5
+  gamma_rank_start: 0.3
+  gamma_rank_end: 0.8
+  rank_warmup_epochs: 30
+  enable_rank: false          # 退化方案：先不开
+  rank_margin: 0.05
+  label_smoothing: 0.05
+  sample_weight_mode: continuous
+  intensity_threshold: 0.5
+  weak_sample_weight: 0.1
+  val_ratio: 0.1
+  test_ratio: 0.1
+  split_unit: trial
+  max_runtime_hours: 10.0
