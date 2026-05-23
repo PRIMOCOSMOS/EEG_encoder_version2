@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# data / runtime artifacts
+runs_*/
+*.npz
+*.pt
+*.zip
+*.zip.*
+*.mat
+preprocessed/
+encoded/
+logs/
