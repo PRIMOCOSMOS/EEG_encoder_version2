@@ -177,6 +177,49 @@ python scripts/ms_fetch.py --dataset DEREKVERSE/SEED-VII   fetch-info --local-di
 python scripts/ms_fetch.py --dataset DEREKVERSE/SEED-VII   fetch-volumes --pattern '*.zip.*' --scratch-dir /workspace/_ms_scratch --keep 1 --delete-after
 ```
 
+## Kaggle 训练流水线
+
+仓库附了一套独立的 Kaggle Notebook：
+
+- **`notebooks/kaggle_pipeline.ipynb`** — Kaggle 端到端流水线（预处理→训练→续训→编码导出→打包）
+- **`notebooks/KAGGLE_DATA_SETUP.md`** — Kaggle 三份资源的准备说明
+
+### Kaggle 需要的三份资源
+
+| # | 内容 | 来源 |
+|---|---|---|
+| 1 | 20 个 `*.mat`（SEED-VII `EEG_preprocessed/`） | **公开** Kaggle Dataset，你在 Notebook 里 Add Data |
+| 2 | `*_save_info.csv`（连续强度标签） | **你自己上传**的私有 Kaggle Dataset |
+| 3 | 本仓库 (`src/`, `scripts/`) | 上传为 Kaggle Dataset / git clone / 粘代码 |
+
+两个数据集挂载到 `/kaggle/input/` 下各自独立的子目录；Notebook 的第一个 cell **暴露了所有路径变量**，并带**容错逻辑**：
+- 找不到 `EEG_MAT_SUBDIR` 会递归扫整个 mat 数据集挂载点
+- 找不到 `SAVE_INFO_SUBDIR` 会回退到根目录扫 `*_save_info.csv`
+
+trigger_info CSV **不强制需要**——SEED-VII 的 `EEG_preprocessed/*.mat` 已经按 trial 切好了。
+
+### Kaggle vs ModelScope 流水线对比
+
+| 维度 | ModelScope 流水线 | Kaggle 流水线 |
+|---|---|---|
+| 数据源 | 远端 zip 分卷 / 合并 zip | **本地 .mat 目录** (`--mat-dir`) |
+| 入口脚本 | `merge_and_upload.py` + `preprocess_to_npz.py` | `preprocess_to_npz.py --mat-dir ...` |
+| Notebook | `notebooks/pipeline.ipynb` | `notebooks/kaggle_pipeline.ipynb` |
+| 超时 | 用户自管 (默认 10h) | **8.5h**（Kaggle 9h 限制留 buffer） |
+| 输出 | 任意路径 | 必须落 `/kaggle/working/` 才能下载 |
+| 数据集挂载 | 手动 SDK 拉 | **Kaggle 自动**挂到 `/kaggle/input/` |
+
+### 4 种数据源（统一通过 `preprocess_to_npz.py` 互斥参数选择）
+
+| 优先级 | 参数 | 适用场景 |
+|---|---|---|
+| **D**（Kaggle） | `--mat-dir <dir>` | 本地 .mat 文件夹（已挂载） |
+| C | `--ms-single-zip <ds>` | ModelScope 合并 zip（HTTP Range，零磁盘） |
+| B | `--ms-dataset <ds>` | ModelScope 多分卷（LRU 缓存，≤2 卷磁盘） |
+| A | `--volumes-dir <dir>` | 本地分卷目录 |
+
+
+
 ## 字节级分卷的正确性说明（用户的实际分卷方式）
 
 用户的 32 个 `*.zip.NNN` 是对**原始 zip 文件**做字节级顺序切片（与 `split -b` / `dd` 等价），

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Stream-preprocess SEED-VII into a single npz.
 
-输入源（三选一，按优先顺序）：
-    C) --ms-single-zip   ModelScope 上**已合并的单一 zip**（推荐；零落盘，HTTP Range 流式）
+输入源（四选一，按优先顺序）：
+    D) --mat-dir         **本地 .mat 目录**（Kaggle 数据集挂载场景；最简单）
+    C) --ms-single-zip   ModelScope 上**已合并的单一 zip**（零落盘，HTTP Range 流式）
                          需先用 `scripts/merge_and_upload.py` 完成合并+上传
     B) --ms-dataset      ModelScope 上的**多分卷**（按需"一卷下载-一处理-一删"）
     A) --volumes-dir     本地分卷目录
@@ -36,6 +37,7 @@ sys.path.insert(0, str(ROOT))
 from src.config import PREPROCESS_DEFAULTS, TRAIN_DEFAULTS  # noqa: E402
 from src.dataset import (  # noqa: E402
     TrialKey,
+    iter_trials_from_mat_dir,
     iter_trials_from_modelscope,
     iter_trials_from_modelscope_single_file,
     iter_trials_from_zip,
@@ -53,6 +55,7 @@ def parse_args():
     src.add_argument("--volumes-dir", help="Local directory of split volumes")
     src.add_argument("--ms-dataset", help="ModelScope dataset id (multi-volume mode)")
     src.add_argument("--ms-single-zip", help="ModelScope dataset id (single merged zip mode; see --ms-single-zip-path)")
+    src.add_argument("--mat-dir", help="Local directory of .mat files (e.g. Kaggle dataset mount)")
     ap.add_argument("--pattern", default="*.zip.*",
                     help="Glob for split volumes inside the source (default: *.zip.*)")
     ap.add_argument("--ms-revision", default="master")
@@ -69,6 +72,12 @@ def parse_args():
                     help="In-memory LRU range cache size when reading the merged zip (MB)")
     ap.add_argument("--ms-range-chunk-mb", type=int, default=8,
                     help="HTTP Range GET chunk size when reading the merged zip (MB)")
+
+    # Local mat-dir mode (D, e.g. Kaggle)
+    ap.add_argument("--mat-pattern", default="*.mat",
+                    help="Glob for .mat files inside --mat-dir (default: *.mat)")
+    ap.add_argument("--mat-non-recursive", action="store_true",
+                    help="If set, do not recurse into subdirectories of --mat-dir")
 
     # save_info
     ap.add_argument("--save-info-dir", default="",
@@ -104,7 +113,16 @@ def parse_args():
 def _make_iter(args):
     """Factory returning a function `() -> iterator of RawTrial` for two passes."""
     only = list(args.only_subjects.split(",")) if args.only_subjects else None
-    if args.ms_single_zip:
+    if args.mat_dir:
+        def _it():
+            return iter_trials_from_mat_dir(
+                mat_dir=args.mat_dir,
+                pattern=args.mat_pattern,
+                only_subjects=only,
+                recursive=not bool(args.mat_non_recursive),
+            )
+        return _it
+    elif args.ms_single_zip:
         def _it():
             return iter_trials_from_modelscope_single_file(
                 dataset_id=args.ms_single_zip,

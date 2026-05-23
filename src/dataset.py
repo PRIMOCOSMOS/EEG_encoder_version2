@@ -279,6 +279,69 @@ def iter_trials_from_zip(
                 except Exception: pass
 
 
+def iter_trials_from_mat_dir(
+    mat_dir: os.PathLike,
+    pattern: str = "*.mat",
+    only_subjects: Optional[Sequence[str]] = None,
+    recursive: bool = True,
+) -> Iterator[RawTrial]:
+    """Stream trials from a LOCAL directory of `*.mat` files (e.g. Kaggle dataset mount).
+
+    No zip involved. Each .mat is loaded sequentially, parsed, then released.
+
+    The .mat file STEM is used as the `subject` identifier (e.g. ``1.mat`` → "1").
+    Inside each .mat we look for numeric field names "1".."80" (per Design.md),
+    each holding a `(62, T)` EEG array; these are mapped to (session, trial)
+    via :func:`trial_field_to_session_trial`.
+
+    Args:
+        mat_dir:    folder containing the .mat files
+        pattern:    glob pattern (default ``*.mat``)
+        only_subjects: optional whitelist of subject stems (e.g. ['1', '5', '20'])
+        recursive:  if True, search nested directories
+    """
+    d = Path(mat_dir)
+    if not d.exists():
+        raise FileNotFoundError(f"mat_dir does not exist: {d}")
+    if recursive:
+        all_mats = sorted(d.rglob(pattern))
+    else:
+        all_mats = sorted(d.glob(pattern))
+    if not all_mats:
+        raise FileNotFoundError(
+            f"No files matched {pattern!r} under {d} (recursive={recursive})"
+        )
+    if only_subjects:
+        wanted = set(map(str, only_subjects))
+        all_mats = [p for p in all_mats if p.stem in wanted]
+    # natural ordering by subject stem
+    all_mats.sort(key=lambda p: _natural_key(p.stem))
+
+    for mat_path in all_mats:
+        subject = mat_path.stem  # "1".."20"
+        data = loadmat(str(mat_path), verify_compressed_data_integrity=False)
+        fields = []
+        for k in data.keys():
+            if k.startswith("__"):
+                continue
+            if k.isdigit():
+                fields.append((int(k), k))
+        fields.sort(key=lambda t: t[0])
+        for fid, name in fields:
+            arr = np.asarray(data[name])
+            if arr.ndim != 2 or arr.shape[0] != 62:
+                continue
+            session_id, trial_in_session = trial_field_to_session_trial(fid)
+            yield RawTrial(
+                subject=subject,
+                session_id=session_id,
+                trial_id=trial_in_session,
+                field_id=fid,
+                eeg=arr,
+            )
+        del data
+
+
 def iter_trials_from_modelscope(
     dataset_id: str,
     pattern: str = "*.zip.*",
