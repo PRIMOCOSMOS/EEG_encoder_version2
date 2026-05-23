@@ -54,9 +54,9 @@ def _parse_save_info_csv(path: Path) -> Dict[int, float]:
 
     SEED-VII official说明：每个 movie clip 都有一行/列 score ∈ [0,1]，
     指示 targeted emotion 的诱发成功度。这里做兼容性解析：
-    - 优先寻找名为 'score' / 'intensity' / 'rating' 的列
-    - 若是单列纯数字（20 行）则直接按行序号取
-    - 若是宽表（1 行 × N 列）则按列序取
+    - 只有在能明确识别表头时，才优先寻找名为 'score' / 'intensity' / 'rating' 的列
+    - 若是逐行记录的明细表，则取每行最后一个数值作为强度
+    - 若是单行宽表（1 行 × N 列）则按列序取全部数值
     """
     with open(path, "r", encoding="utf-8-sig", newline="") as fh:
         sample = fh.read()
@@ -69,12 +69,19 @@ def _parse_save_info_csv(path: Path) -> Dict[int, float]:
         return {}
 
     header = rows[0]
-    has_header = any(not _is_floatish(c) for c in header)
+    lowered = [c.strip().lower() for c in header]
+    header_score_cols = {"score", "intensity", "rating", "feedback"}
+    has_header = any(c in header_score_cols for c in lowered)
+    if not has_header:
+        # A row that contains path-like text or numeric data is usually a data row,
+        # not a header. The SEED-VII save_info sample is formatted this way.
+        has_numeric = any(_is_floatish(c) for c in header)
+        has_path_like = any(_looks_like_pathish(c) for c in header)
+        has_header = (not has_numeric) and (not has_path_like) and len(rows) > 1
 
     scores: List[float] = []
     if has_header:
         target_col = -1
-        lowered = [c.strip().lower() for c in header]
         for cand in ("score", "intensity", "rating", "feedback"):
             if cand in lowered:
                 target_col = lowered.index(cand)
@@ -84,25 +91,20 @@ def _parse_save_info_csv(path: Path) -> Dict[int, float]:
                 if target_col < len(r) and _is_floatish(r[target_col]):
                     scores.append(_to_unit(float(r[target_col])))
         else:
-            # fall back: take the last numeric column
+            # fall back: take the last numeric column in each data row
             for r in rows[1:]:
-                for c in reversed(r):
-                    if _is_floatish(c):
-                        scores.append(_to_unit(float(c)))
-                        break
+                numeric_vals = [_to_unit(float(c)) for c in r if _is_floatish(c)]
+                if numeric_vals:
+                    scores.append(numeric_vals[-1])
     else:
-        # no header
         if len(rows) == 1 and len(rows[0]) >= 5:
             # wide row
-            for c in rows[0]:
-                if _is_floatish(c):
-                    scores.append(_to_unit(float(c)))
+            scores.extend(_to_unit(float(c)) for c in rows[0] if _is_floatish(c))
         else:
             for r in rows:
-                for c in r:
-                    if _is_floatish(c):
-                        scores.append(_to_unit(float(c)))
-                        break
+                numeric_vals = [_to_unit(float(c)) for c in r if _is_floatish(c)]
+                if numeric_vals:
+                    scores.append(numeric_vals[-1])
 
     out: Dict[int, float] = {}
     for i, s in enumerate(scores, start=1):
@@ -116,6 +118,11 @@ def _is_floatish(s: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _looks_like_pathish(s: str) -> bool:
+    s = s.strip()
+    return ("/" in s) or ("\\" in s) or ("." in Path(s).name and not _is_floatish(s))
 
 
 def _to_unit(v: float) -> float:

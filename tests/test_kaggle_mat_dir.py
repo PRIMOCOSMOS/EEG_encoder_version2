@@ -19,6 +19,8 @@ sys.path.insert(0, str(REPO))
 import numpy as np
 import scipy.io
 
+from src.dataset import load_save_info_intensity
+
 
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="kaggle_mat_dir_test_"))
@@ -43,17 +45,24 @@ def main():
 
     # ---- 2. Build save_info CSVs ----
     # Filename: subjectID_date_sessionID_save_info.csv
-    # Content: a header row + 20 rows of scores. We only use first 2 (corresponding to
-    # trials 1 and 2 within session 1).
+    # Content matches the real SEED-VII export style: each row is a movie entry and
+    # the final column is the continuous intensity value.
     for sid in range(1, 4):
-        # simple CSV with header "score" and 20 numeric rows
-        rows = ["score"]
+        rows = []
         for i in range(20):
-            rows.append(f"{0.4 + 0.02 * i + 0.01 * sid:.4f}")
-        (save_dir / f"{sid}_20240101_1_save_info.csv").write_text("\n".join(rows))
+            score = 0.4 + 0.02 * i + 0.01 * sid
+            rows.append(
+                f"emotion tasks,movie\\七类\\{sid}\\happy\\clip_{i + 1}.mp4,{score:.4f}"
+            )
+        (save_dir / f"{sid}_20240101_1_save_info.csv").write_text("\n".join(rows), encoding="utf-8")
         # Add a trigger_info.csv (not used by our pipeline but should not break things)
         trig = ["trigger,time", "1,0", "2,60"] * 10
-        (save_dir / f"{sid}_20240101_1_trigger_info.csv").write_text("\n".join(trig))
+        (save_dir / f"{sid}_20240101_1_trigger_info.csv").write_text("\n".join(trig), encoding="utf-8")
+
+    parsed = load_save_info_intensity(save_dir)
+    assert len(parsed) == 60, f"unexpected parsed labels: {len(parsed)}"
+    assert abs(parsed[("1", 1, 1)] - 0.41) < 1e-9
+    assert abs(parsed[("3", 1, 20)] - 0.81) < 1e-9
 
     # ---- 3. Run preprocess_to_npz.py via subprocess (real CLI test) ----
     out_npz = tmp / "out.npz"
