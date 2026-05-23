@@ -84,3 +84,50 @@ python scripts/upload_to_modelscope.py \
 ```
 
 也可直接打开 `notebooks/pipeline.ipynb` 一键运行。
+
+
+## ModelScope 模式（实例不能挂载数据集时使用）
+
+ModelScope 上的数据集**不能直接挂载**到实例工作区，必须通过 `MsDataset` / `HubApi` /
+`dataset_file_download` 拉取。本仓库为此提供了：
+
+- `src/ms_download.py` — 列表、单文件下载、`save_info` 批量下载、**`StreamingVolumeFetcher`**（一卷下载-用完-即删）。
+- `src/zip_stream.py::LazyConcatStream` — 按需切片下载 + LRU 释放（任意时刻磁盘 ≤ N 个分卷）。
+- `src/dataset.py::iter_trials_from_modelscope(...)` — 直接对接 ModelScope，再复用既有预处理管线。
+- `scripts/ms_fetch.py` — `list / fetch-info / fetch-one / fetch-volumes` 四个子命令。
+- 现有 `scripts/merge_volumes.py` 和 `scripts/preprocess_to_npz.py` 都新增了 `--ms-dataset` 入口；
+  本地 / 远端两种来源**互斥可选**，其余参数不变。
+
+磁盘占用：默认 `--ms-max-resident-volumes 2` → 任意时刻最多 ≈ 11 GB（远低于 100 GB 持久化盘）。
+
+```bash
+# 登录（任选其一）
+export MODELSCOPE_API_TOKEN=xxxxxxxx
+# 或者：python -c "from modelscope.hub.api import HubApi; HubApi().login('xxxxxxxx')"
+
+# 1) 列出 + 校验远端分卷（不下载）
+python scripts/merge_volumes.py   --ms-dataset DEREKVERSE/SEED-VII --pattern '*.zip.*'   --scratch-dir /workspace/_ms_scratch
+
+# 2) 流式预处理 → npz（远端按需拉取，处理一个删一个）
+python scripts/preprocess_to_npz.py   --ms-dataset DEREKVERSE/SEED-VII --pattern '*.zip.*'   --ms-scratch-dir /workspace/_ms_scratch   --ms-max-resident-volumes 2   --ms-save-info-include 'save_info/*_save_info.csv'   --output /workspace/preprocessed/seed_vii.npz
+
+# 3 / 4) 训练、续训、编码导出（同本地模式，从 npz 读取，无需关心数据源）
+python scripts/train.py  --data /workspace/preprocessed/seed_vii.npz --output-dir /workspace/runs --device auto --amp --max-runtime-hours 10
+python scripts/encode.py --data /workspace/preprocessed/seed_vii.npz --checkpoint /workspace/runs/best_encoder.pt --output /workspace/encoded.npz
+
+# 5) 上传（同前）
+python scripts/upload_to_modelscope.py --local-file /workspace/SEED-VII.zip   --dataset DEREKVERSE/SEED-VII --path-in-repo data/SEED-VII.zip
+```
+
+辅助命令：
+
+```bash
+# 列出远端所有 .zip.* 分卷
+python scripts/ms_fetch.py --dataset DEREKVERSE/SEED-VII list --pattern '*.zip.*'
+
+# 只下载 save_info CSV（小文件）
+python scripts/ms_fetch.py --dataset DEREKVERSE/SEED-VII   fetch-info --local-dir /workspace/save_info   --include 'save_info/*_save_info.csv'
+
+# 烟雾测试：流式下载 + 立即删除每个分卷
+python scripts/ms_fetch.py --dataset DEREKVERSE/SEED-VII   fetch-volumes --pattern '*.zip.*' --scratch-dir /workspace/_ms_scratch --keep 1 --delete-after
+```

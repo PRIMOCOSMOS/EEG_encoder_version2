@@ -31,6 +31,7 @@ from .zip_stream import (
     extract_mat_bytes,
     iter_mat_members,
     open_concat_zip,
+    open_remote_concat_zip,
 )
 
 
@@ -161,52 +162,148 @@ class RawTrial:
     eeg: np.ndarray         # (62, T)
 
 
+def _iter_trials_from_zipfile(
+    zf,
+    subdir_keyword: str = "EEG_preprocessed",
+    only_subjects: Optional[Sequence[str]] = None,
+) -> Iterator[RawTrial]:
+    """Core: given an opened ZipFile, iterate (subject, session, trial, eeg) records."""
+    members = list(iter_mat_members(zf, subdir_keyword=subdir_keyword))
+    if only_subjects:
+        wanted = set(map(str, only_subjects))
+        members = [m for m in members if Path(m.filename).stem in wanted]
+    members.sort(key=lambda m: _natural_key(Path(m.filename).stem))
+    for info in members:
+        subject = Path(info.filename).stem  # "1".."20"
+        raw_bytes = extract_mat_bytes(zf, info)
+        data = loadmat(
+            io.BytesIO(raw_bytes),
+            verify_compressed_data_integrity=False,
+        )
+        fields = []
+        for k in data.keys():
+            if k.startswith("__"):
+                continue
+            if k.isdigit():
+                fields.append((int(k), k))
+        fields.sort(key=lambda t: t[0])
+        del raw_bytes  # free as early as possible
+        for fid, name in fields:
+            arr = np.asarray(data[name])
+            if arr.ndim != 2 or arr.shape[0] != 62:
+                continue
+            session_id, trial_in_session = trial_field_to_session_trial(fid)
+            yield RawTrial(
+                subject=subject,
+                session_id=session_id,
+                trial_id=trial_in_session,
+                field_id=fid,
+                eeg=arr,
+            )
+        del data
+
+
 def iter_trials_from_zip(
     volumes_dir: os.PathLike,
     pattern: str = "*.zip.*",
     subdir_keyword: str = "EEG_preprocessed",
     only_subjects: Optional[Sequence[str]] = None,
 ) -> Iterator[RawTrial]:
-    """Stream every (subject × 80 trials) from the multi-volume zip without disk extraction.
+    """Stream every (subject × 80 trials) from a LOCAL multi-volume zip without disk extraction.
 
     Each `.mat` is read into memory transiently (≈ tens of MB), parsed, then discarded.
     """
     zf = open_concat_zip(volumes_dir, pattern=pattern)
     try:
-        members = list(iter_mat_members(zf, subdir_keyword=subdir_keyword))
-        if only_subjects:
-            wanted = set(map(str, only_subjects))
-            members = [m for m in members if Path(m.filename).stem in wanted]
-        members.sort(key=lambda m: _natural_key(Path(m.filename).stem))
-        for info in members:
-            subject = Path(info.filename).stem  # "1".."20"
-            raw_bytes = extract_mat_bytes(zf, info)
-            data = loadmat(
-                io.BytesIO(raw_bytes),
-                verify_compressed_data_integrity=False,
-            )
-            # collect numbered fields ("1".."80"), preserve numeric order
-            fields = []
-            for k in data.keys():
-                if k.startswith("__"):
-                    continue
-                if k.isdigit():
-                    fields.append((int(k), k))
-            fields.sort(key=lambda t: t[0])
-            del raw_bytes  # free as early as possible
-            for fid, name in fields:
-                arr = np.asarray(data[name])
-                if arr.ndim != 2 or arr.shape[0] != 62:
-                    continue
-                session_id, trial_in_session = trial_field_to_session_trial(fid)
-                yield RawTrial(
-                    subject=subject,
-                    session_id=session_id,
-                    trial_id=trial_in_session,
-                    field_id=fid,
-                    eeg=arr,
-                )
-            del data
+        yield from _iter_trials_from_zipfile(
+            zf, subdir_keyword=subdir_keyword, only_subjects=only_subjects,
+        )
+    finally:
+        zf.close()
+
+
+def iter_trials_from_modelscope(
+    dataset_id: str,
+    pattern: str = "*.zip.*",
+    scratch_dir: str = "./_ms_volumes_cache",
+    revision: str = "master",
+    token: Optional[str] = None,
+    subdir_keyword: str = "EEG_preprocessed",
+    only_subjects: Optional[Sequence[str]] = None,
+    max_resident_volumes: int = 2,
+) -> Iterator[RawTrial]:
+    """Stream trials directly from a ModelScope dataset (no manual download step).
+
+    Internally:
+      1) List & sort the remote split volumes by trailing digits.
+      2) Build a `LazyConcatStream` that downloads each volume only when its bytes
+         are needed and evicts the oldest one once we hold more than `max_resident_volumes`.
+      3) Hand the stream to `zipfile.ZipFile` and reuse the existing per-trial iterator.
+
+    Disk footprint: at most `max_resident_volumes` × 5.37GB (default 2 → ≤ ~11GB), no matter
+    how big the dataset is in total.
+    """
+    from .ms_download import (
+        discover_remote_volumes,
+        download_one_file,
+        list_dataset_files,
+        login_if_token,
+    )
+
+    login_if_token(token)
+
+    # 1) discover & get sizes
+    listing = list_dataset_files(dataset_id, revision=revision, token=token)
+    # filter by glob
+    import fnmatch as _fn
+    listing = [f for f in listing if _fn.fnmatch(f.get("Path", ""), pattern)]
+    if not listing:
+        raise RuntimeError(f"No remote volumes matched {pattern} in {dataset_id}")
+
+    def _digit_key(name: str):
+        digits = ""
+        for ch in reversed(name):
+            if ch.isdigit():
+                digits = ch + digits
+            else:
+                if digits:
+                    break
+        return (int(digits) if digits else 0, name)
+    listing.sort(key=lambda f: _digit_key(f.get("Path", "")))
+
+    sizes_in_order = [(f["Path"], int(f.get("Size", 0) or 0)) for f in listing]
+    missing_sizes = [n for n, s in sizes_in_order if s <= 0]
+    if missing_sizes:
+        raise RuntimeError(
+            f"Remote volume size missing from listing for: {missing_sizes[:3]}... "
+            "ModelScope API did not return Size. Cannot lazy-stream without size."
+        )
+
+    Path(scratch_dir).mkdir(parents=True, exist_ok=True)
+
+    def _fetch(remote_name: str) -> str:
+        p = download_one_file(
+            dataset_id, remote_name, scratch_dir,
+            revision=revision, token=token,
+        )
+        return str(p)
+
+    def _evict(local_path: Path) -> None:
+        try:
+            local_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    zf = open_remote_concat_zip(
+        sizes_in_order=sizes_in_order,
+        fetcher=_fetch,
+        evicter=_evict,
+        max_resident=max_resident_volumes,
+    )
+    try:
+        yield from _iter_trials_from_zipfile(
+            zf, subdir_keyword=subdir_keyword, only_subjects=only_subjects,
+        )
     finally:
         zf.close()
 

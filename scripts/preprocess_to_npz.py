@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Stream-preprocess SEED-VII into a single (or sharded) npz.
+"""Stream-preprocess SEED-VII into a single npz.
+
+输入源（互斥）：
+    A) --volumes-dir  本地分卷目录
+    B) --ms-dataset   ModelScope 数据集（实例无法挂载时用，按需「一卷下载-一处理-一删」）
 
 严格执行 Design.md：
-    1) **流式** 从 32 分卷 zip 中按需读取每个 subject 的 .mat（处理完立即释放）。
+    1) **流式** 从分卷 zip 中按需读取每个 subject 的 .mat（处理完立即释放）。
+       ModelScope 模式磁盘占用 ≤ 2×5.37GB ≈ 11GB。
     2) **先切分、后处理**：依据 (subject, session, trial) 做 trial-level 划分。
     3) 预处理：基线 → CAR →（可选 ICA）→ 居中 60% → 4s 窗口 50% 重叠 → 按通道 z-score。
     4) 标签：7 类整数 + 来自 save_info CSV 的连续强度 ∈ [0,1]（缺失时填默认值）。
+       save_info 可以本地 --save-info-dir 也可以从同一个 MS dataset 拉取（--ms-save-info-include）。
 
 输出 npz 字段：
     X (N,62,800) float32, y (N,) int64, s (N,) float32,
@@ -27,20 +33,41 @@ sys.path.insert(0, str(ROOT))
 
 from src.config import PREPROCESS_DEFAULTS, TRAIN_DEFAULTS  # noqa: E402
 from src.dataset import (  # noqa: E402
-    TrialKey, iter_trials_from_zip, load_save_info_intensity,
-    save_dataset_npz, split_trials,
+    TrialKey,
+    iter_trials_from_modelscope,
+    iter_trials_from_zip,
+    load_save_info_intensity,
+    save_dataset_npz,
+    split_trials,
 )
 from src.labels import EMOTION_TO_IDX, trial_id_to_emotion  # noqa: E402
 from src.preprocess import preprocess_trial  # noqa: E402
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Stream-preprocess SEED-VII multi-volume zip to npz")
-    ap.add_argument("--volumes-dir", required=True)
-    ap.add_argument("--pattern", default="*.zip.*")
-    ap.add_argument("--save-info-dir", default="", help="Folder of save_info CSVs (continuous labels)")
+    ap = argparse.ArgumentParser(description="Stream-preprocess SEED-VII (local volumes OR ModelScope) to npz")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--volumes-dir", help="Local directory of split volumes")
+    src.add_argument("--ms-dataset", help="ModelScope dataset id (e.g. DEREKVERSE/SEED-VII)")
+    ap.add_argument("--pattern", default="*.zip.*",
+                    help="Glob for split volumes inside the source (default: *.zip.*)")
+    ap.add_argument("--ms-revision", default="master")
+    ap.add_argument("--ms-token", default="", help="ModelScope token (overrides env)")
+    ap.add_argument("--ms-scratch-dir", default="./_ms_volumes_cache",
+                    help="Where to cache downloaded volumes during streaming")
+    ap.add_argument("--ms-max-resident-volumes", type=int, default=2,
+                    help="How many split volumes are allowed on disk simultaneously")
+
+    # save_info
+    ap.add_argument("--save-info-dir", default="",
+                    help="Local folder of save_info CSVs (continuous labels)")
+    ap.add_argument("--ms-save-info-include", default="",
+                    help="If set with --ms-dataset, download save_info CSVs matching this glob "
+                         "(e.g. 'save_info/*_save_info.csv') into --ms-scratch-dir/save_info")
+
     ap.add_argument("--output", required=True, help="Output .npz path")
     ap.add_argument("--subdir-keyword", default="EEG_preprocessed")
+
     # preprocess overrides
     ap.add_argument("--window-seconds", type=float, default=float(PREPROCESS_DEFAULTS["window_seconds"]))
     ap.add_argument("--step-seconds", type=float, default=float(PREPROCESS_DEFAULTS["step_seconds"]))
@@ -48,17 +75,61 @@ def parse_args():
     ap.add_argument("--max-windows-per-trial", type=int, default=int(PREPROCESS_DEFAULTS["max_windows_per_trial"]))
     ap.add_argument("--use-ica", action="store_true")
     ap.add_argument("--no-car", action="store_true")
-    ap.add_argument("--default-intensity", type=float, default=1.0,
-                    help="Fallback intensity for trials missing in save_info")
+    ap.add_argument("--default-intensity", type=float, default=1.0)
+
     # split
     ap.add_argument("--val-ratio", type=float, default=float(TRAIN_DEFAULTS["val_ratio"]))
     ap.add_argument("--test-ratio", type=float, default=float(TRAIN_DEFAULTS["test_ratio"]))
     ap.add_argument("--split-unit", choices=["trial", "subject", "session"],
                     default=str(TRAIN_DEFAULTS["split_unit"]))
     ap.add_argument("--seed", type=int, default=int(TRAIN_DEFAULTS["seed"]))
+
     # subset
     ap.add_argument("--only-subjects", default="", help="Comma-list of subject filenames, e.g. '1,2,3'")
     return ap.parse_args()
+
+
+def _make_iter(args):
+    """Factory returning a function `() -> iterator of RawTrial` for two passes."""
+    only = list(args.only_subjects.split(",")) if args.only_subjects else None
+    if args.volumes_dir:
+        def _it():
+            return iter_trials_from_zip(
+                args.volumes_dir, pattern=args.pattern,
+                subdir_keyword=args.subdir_keyword,
+                only_subjects=only,
+            )
+        return _it
+    else:
+        def _it():
+            return iter_trials_from_modelscope(
+                dataset_id=args.ms_dataset,
+                pattern=args.pattern,
+                scratch_dir=args.ms_scratch_dir,
+                revision=args.ms_revision,
+                token=(args.ms_token or None),
+                subdir_keyword=args.subdir_keyword,
+                only_subjects=only,
+                max_resident_volumes=args.ms_max_resident_volumes,
+            )
+        return _it
+
+
+def _resolve_save_info_dir(args) -> str:
+    if args.save_info_dir:
+        return args.save_info_dir
+    if args.ms_dataset and args.ms_save_info_include:
+        from src.ms_download import download_save_info
+        local = Path(args.ms_scratch_dir) / "save_info"
+        download_save_info(
+            dataset_id=args.ms_dataset,
+            local_dir=str(local),
+            revision=args.ms_revision,
+            token=(args.ms_token or None),
+            include=[p.strip() for p in args.ms_save_info_include.split(",") if p.strip()],
+        )
+        return str(local)
+    return ""
 
 
 def main():
@@ -73,31 +144,27 @@ def main():
 
     # ---- intensities ----
     intensities: Dict[Tuple[str, int, int], float] = {}
-    if args.save_info_dir:
-        intensities = load_save_info_intensity(args.save_info_dir)
-        print(f"[INFO] loaded {len(intensities)} continuous labels from {args.save_info_dir}")
+    save_info_dir = _resolve_save_info_dir(args)
+    if save_info_dir:
+        intensities = load_save_info_intensity(save_info_dir)
+        print(f"[INFO] loaded {len(intensities)} continuous labels from {save_info_dir}")
     else:
-        print("[WARN] --save-info-dir not given; all intensities default to "
+        print("[WARN] No save_info provided; defaulting intensities to "
               f"{args.default_intensity}")
 
-    # ---- pass 1: enumerate trials to know labels for stratified split ----
-    print("[INFO] Pass 1: enumerating trial keys & labels (no data loading) ...")
+    iter_factory = _make_iter(args)
+
+    # ---- pass 1: enumerate trial keys & labels (needed for stratified split) ----
+    print("[INFO] Pass 1: enumerating trial keys & labels ...")
     trial_keys: List[TrialKey] = []
     trial_labels: List[int] = []
-    only = set(args.only_subjects.split(",")) if args.only_subjects else None
-    # We don't need to actually read EEG just for the list; we can infer from constants:
-    #  subjects come from filenames 1..20 (we trust the volumes contain them).
-    # But to be robust we stream once with eeg dropped early.
-    for trial in iter_trials_from_zip(
-        args.volumes_dir, pattern=args.pattern, subdir_keyword=args.subdir_keyword,
-        only_subjects=list(only) if only else None,
-    ):
+    for trial in iter_factory():
         code = trial_id_to_emotion(trial.session_id, trial.trial_id)
         y = EMOTION_TO_IDX[code]
         trial_keys.append(TrialKey(trial.subject, trial.session_id, trial.trial_id))
         trial_labels.append(y)
-
     print(f"[INFO] total trials enumerated: {len(trial_keys)}")
+
     train_keys, val_keys, test_keys = split_trials(
         trial_keys, trial_labels,
         val_ratio=args.val_ratio, test_ratio=args.test_ratio,
@@ -117,15 +184,11 @@ def main():
     split_indices: Dict[str, List[int]] = {"train": [], "val": [], "test": []}
 
     print("[INFO] Pass 2: streaming + preprocessing ...")
-    pbar = tqdm(iter_trials_from_zip(
-        args.volumes_dir, pattern=args.pattern, subdir_keyword=args.subdir_keyword,
-        only_subjects=list(only) if only else None,
-    ), total=len(trial_keys))
+    pbar = tqdm(iter_factory(), total=len(trial_keys))
     for trial in pbar:
         key_t = (trial.subject, trial.session_id, trial.trial_id)
         split_name = key_to_split.get(key_t)
         if split_name is None:
-            # filtered out by some reason
             continue
         code = trial_id_to_emotion(trial.session_id, trial.trial_id)
         y_idx = EMOTION_TO_IDX[code]
@@ -143,8 +206,6 @@ def main():
         if arr.shape[0] == 0:
             continue
 
-        base = len(X_list) if X_list else 0
-        # we'll concat at the end; track running offsets via len(y_list)
         start_idx = len(y_list)
         for i in range(arr.shape[0]):
             X_list.append(arr[i:i+1])
@@ -160,12 +221,10 @@ def main():
         pbar.set_postfix({"subj": trial.subject, "sess": trial.session_id,
                           "trial": trial.trial_id, "n": end_idx - start_idx,
                           "split": split_name})
-
-        # explicit free
         del arr, metas
 
     if not X_list:
-        raise RuntimeError("No windows produced. Check volumes / pattern / save_info.")
+        raise RuntimeError("No windows produced. Check source / pattern / save_info.")
 
     X = np.concatenate(X_list, axis=0)
     y = np.asarray(y_list, dtype=np.int64)
