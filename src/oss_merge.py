@@ -168,25 +168,32 @@ def _make_oss_bucket(dataset_id: str, revision: str, token: Optional[str]):
 
 def init_or_resume_multipart(
     bucket, object_key: str, total_volumes: int,
-) -> Tuple[str, List[int]]:
+):
     """Init a new multipart upload OR resume an in-progress one for the same key.
 
     Returns (upload_id, list_of_already_done_part_numbers).
     """
     import oss2
 
-    # Look for an in-progress upload for this exact key
     existing_id = None
-    for u in oss2.MultipartUploadIterator(bucket, prefix=object_key):
-        if u.key == object_key:
-            # Take the most recent one (iterator returns in time order)
-            existing_id = u.upload_id
+    try:
+        for u in oss2.MultipartUploadIterator(bucket, prefix=object_key):
+            if u.key == object_key:
+                existing_id = u.upload_id
+    except oss2.exceptions.AccessDenied as e:
+        print(
+            "[Stage 1] [WARN] OSS STS policy does not allow ListMultipartUploads; "
+            "cannot auto-discover existing upload_id from bucket. "
+            "Falling back to a fresh multipart upload. "
+            "Keep the local state file for resume.\n"
+            f"original error: {e}"
+        )
+        existing_id = None
 
     if existing_id is None:
         result = bucket.init_multipart_upload(object_key)
         return result.upload_id, []
 
-    # Resume: enumerate already uploaded parts
     done = []
     for p in oss2.PartIterator(bucket, object_key, existing_id):
         done.append(p.part_number)
