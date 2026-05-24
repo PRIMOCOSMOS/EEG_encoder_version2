@@ -119,9 +119,13 @@ def discover_volumes(dataset_id: str, pattern: str, revision: str, token: Option
     return sized
 
 
-def _make_oss_bucket(dataset_id: str, revision: str, token: Optional[str]):
-    """Build an oss2.Bucket using ModelScope's STS credentials."""
-    import oss2  # lazy
+def _make_oss_bucket(
+    dataset_id: str,
+    revision: str,
+    token: Optional[str],
+):
+    """Build an oss2.Bucket using ModelScope STS credentials."""
+    import oss2
     from modelscope.hub.api import HubApi
 
     login_if_token(token)
@@ -135,7 +139,6 @@ def _make_oss_bucket(dataset_id: str, revision: str, token: Optional[str]):
     region = oss_config["Region"]
     endpoint = f"https://{region}.aliyuncs.com"
 
-    # ModelScope rotates STS creds; use a provider so oss2 refreshes them automatically
     from oss2 import CredentialsProvider
     from oss2.credentials import Credentials
 
@@ -151,13 +154,18 @@ def _make_oss_bucket(dataset_id: str, revision: str, token: Optional[str]):
             return Credentials(
                 cfg["AccessId"], cfg["AccessSecret"], cfg["SecurityToken"],
             )
+
     auth = oss2.ProviderAuthV4(_Provider(api, name, namespace, revision))
 
     bucket_name = oss_config["Bucket"]
+    
+    # ===== 关键修复：20 分钟读写超时，防止大 Part 上传被中断 =====
     bucket = oss2.Bucket(
         auth=auth, endpoint=endpoint,
         bucket_name=bucket_name,
         region=region.lstrip("oss-"),
+        connect_timeout=60,      # 连接建立最多 60 秒
+        read_timeout=1200,       # 上传/读取最多 1200 秒（20 分钟）
     )
     return bucket, bucket_name, oss_config["Dir"]
 
