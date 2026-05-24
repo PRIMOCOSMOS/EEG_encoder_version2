@@ -159,14 +159,21 @@ def _make_oss_bucket(
 
     bucket_name = oss_config["Bucket"]
     
-    # ===== 关键修复：20 分钟读写超时，防止大 Part 上传被中断 =====
+    # 创建 bucket（不在这里传 timeout 参数，避免版本不兼容）
     bucket = oss2.Bucket(
         auth=auth, endpoint=endpoint,
         bucket_name=bucket_name,
         region=region.lstrip("oss-"),
-        connect_timeout=60,      # 连接建立最多 60 秒
-        read_timeout=1200,       # 上传/读取最多 1200 秒（20 分钟）
     )
+    
+    # ===== 关键修复：所有 oss2 版本都支持实例方法设置超时 =====
+    try:
+        bucket.set_connect_timeout(60)      # 连接建立最多 60 秒
+        bucket.set_read_timeout(2400)     # 上传/读取最多 2400 秒（40 分钟）
+    except AttributeError:
+        # 极旧版本 fallback：直接写 timeout tuple (connect, read)
+        bucket.timeout = (60, 2400)
+    
     return bucket, bucket_name, oss_config["Dir"]
 
 
