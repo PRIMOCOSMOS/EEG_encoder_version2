@@ -43,7 +43,15 @@ from .zip_stream import (
 # 1) save_info → intensity
 # ---------------------------------------------------------------------------
 
+# 支持多种命名：
+#  1) 1_20221001_1_save_info.csv  (subject_date_session)
+#  2) 1_1_save_info.csv            (subject_session)
 _FILENAME_RE = re.compile(
+    r"^(?P<subject>\d+)(?:_(?P<date>\d{8}))?_(?P<session>\d+)_save_info\.csv$",
+    re.IGNORECASE,
+)
+# 兼容旧的非数字subject
+_FILENAME_RE_LEGACY = re.compile(
     r"^(?P<subject>[^_/\\]+)_(?P<date>[^_/\\]+)_(?P<session>\d+)_save_info\.csv$",
     re.IGNORECASE,
 )
@@ -149,14 +157,24 @@ def load_save_info_intensity(save_info_dir: os.PathLike) -> Dict[Tuple[str, int,
         return {}
     out: Dict[Tuple[str, int, int], float] = {}
     for p in d.glob("*_save_info.csv"):
-        m = _FILENAME_RE.match(p.name)
+        m = _FILENAME_RE.match(p.name) or _FILENAME_RE_LEGACY.match(p.name)
         if not m:
-            continue
-        subject = m.group("subject")
-        session = int(m.group("session"))
+            # 兜底：提取前两个数字作为 subject/session
+            nums = re.findall(r"\d+", p.stem)
+            if len(nums) >= 2:
+                subject = nums[0]
+                session = int(nums[1])
+                print(f"[WARN] Unrecognized save_info filename '{p.name}', fallback parsed as subject={subject}, session={session}")
+            else:
+                print(f"[WARN] Skipping unrecognized save_info file: {p.name}")
+                continue
+        else:
+            subject = m.group("subject")
+            session = int(m.group("session"))
         scores = _parse_save_info_csv(p)
         for tid, val in scores.items():
             out[(subject, session, tid)] = float(val)
+    print(f"[INFO] load_save_info_intensity: parsed {len(out)} entries from {len(list(d.glob('*_save_info.csv')))} files")
     return out
 
 
