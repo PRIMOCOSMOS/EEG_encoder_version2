@@ -1,32 +1,35 @@
 #!/usr/bin/env python3
 """Stream-preprocess SEED-VII into a single npz.
 
-输入源（四选一，按优先顺序）：
-    D) --mat-dir         **本地 .mat 目录**（Kaggle 数据集挂载场景；最简单）
-    C) --ms-single-zip   ModelScope 上**已合并的单一 zip**（零落盘，HTTP Range 流式）
-                         需先用 `scripts/merge_and_upload.py` 完成合并+上传
-    B) --ms-dataset      ModelScope 上的**多分卷**（按需"一卷下载-一处理-一删"）
-    A) --volumes-dir     本地分卷目录
+*** 内存友好版（OOM 修复） ***
 
-严格执行 Design.md：
-    1) **流式** 从分卷 zip 中按需读取每个 subject 的 .mat（处理完立即释放）。
-       ModelScope 模式磁盘占用 ≤ 2×5.37GB ≈ 11GB。
-    2) **先切分、后处理**：依据 (subject, session, trial) 做 trial-level 划分。
-    3) 预处理：基线 → CAR →（可选 ICA）→ 居中 60% → 4s 窗口 50% 重叠 → 按通道 z-score。
-    4) 标签：7 类整数 + 来自 save_info CSV 的连续强度 ∈ [0,1]（缺失时填默认值）。
-       save_info 可以本地 --save-info-dir 也可以从同一个 MS dataset 拉取（--ms-save-info-include）。
+主要改动相对原版：
+1) Pass 1 只读 .mat 的字段名，不再 loadmat 整个 EEG（V7 用 h5py，旧版回退到 whosmat / 仅取键）。
+   原版每个 subject 会把 ~3 GB EEG 读入内存只为了拿 trial key，极度浪费。
+2) Pass 2 改为「磁盘 memmap 流式写入」：
+   - 预先按 enumerated trial 数 × max_windows_per_trial 申请上限 memmap，
+   - 处理一个 trial 立刻写入 memmap 对应区段，并 del 释放原数组，
+   - 完全不再走 X_list.append + np.concatenate 的 2× 内存峰值路径。
+3) Pass 2 末尾不再 np.savez_compressed（它会再吃一份内存做压缩缓冲）。
+   改为：先把 memmap 截断为真实长度，再用 np.savez(uncompressed) 写出，
+   或可选 --compress 走 streaming 拷贝（一次一个数组）。
+4) preprocess_trial 内部我们额外用 in-place CAR / 基线 / zscore 的小路径
+   通过 cfg["inplace"]=True 触发（见 src/preprocess.py 同步补丁）。
+5) 顺手把 --tmp-dir 暴露出来；默认放在 --output 同级，磁盘吃紧时可指向更大的卷。
 
-输出 npz 字段：
+输出 npz 字段（与原版兼容）：
     X (N,62,800) float32, y (N,) int64, s (N,) float32,
     meta (N,) JSON-string, split_train/val/test (M_*,) int64 索引
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from tqdm import tqdm
@@ -42,49 +45,107 @@ from src.dataset import (  # noqa: E402
     iter_trials_from_modelscope_single_file,
     iter_trials_from_zip,
     load_save_info_intensity,
-    save_dataset_npz,
     split_trials,
 )
 from src.labels import EMOTION_TO_IDX, trial_id_to_emotion  # noqa: E402
 from src.preprocess import preprocess_trial  # noqa: E402
 
 
+# ------------------------------------------------------------------
+# Lightweight Pass-1: enumerate (subject, session, trial) WITHOUT
+# loading the EEG arrays. Saves ~3 GB of RSS per subject on SEED-VII.
+# ------------------------------------------------------------------
+def _light_enumerate_trial_keys_from_mat_dir(
+    mat_dir: str,
+    pattern: str,
+    only_subjects: Optional[List[str]],
+    recursive: bool,
+) -> List[Tuple[str, int, int]]:
+    from src.labels import trial_field_to_session_trial
+
+    d = Path(mat_dir)
+    if recursive:
+        all_mats = sorted(d.rglob(pattern))
+    else:
+        all_mats = sorted(d.glob(pattern))
+    if only_subjects:
+        wanted = set(map(str, only_subjects))
+        all_mats = [p for p in all_mats if p.stem in wanted]
+
+    keys: List[Tuple[str, int, int]] = []
+    for mp in all_mats:
+        subject = mp.stem
+        field_ids: List[int] = []
+
+        # Try MAT v7.3 (HDF5) first -- this is what SEED-VII ships.
+        used_h5 = False
+        try:
+            import h5py  # type: ignore
+
+            with h5py.File(str(mp), "r") as f:
+                for k in f.keys():
+                    if k.startswith("#"):
+                        continue
+                    if k.isdigit():
+                        field_ids.append(int(k))
+            used_h5 = True
+        except Exception:
+            used_h5 = False
+
+        if not used_h5:
+            # Older MAT (<v7.3). Use whosmat: it only reads the directory,
+            # not the matrix data.
+            try:
+                from scipy.io import whosmat
+                info = whosmat(str(mp))
+                for name, _shape, _dtype in info:
+                    if name.isdigit():
+                        field_ids.append(int(name))
+            except Exception as e:
+                print(f"[WARN] light-enum failed on {mp.name}: {e}; "
+                      "falling back to full loadmat for this file.")
+                from scipy.io import loadmat
+                data = loadmat(str(mp), verify_compressed_data_integrity=False)
+                for k in data.keys():
+                    if k.startswith("__"):
+                        continue
+                    if k.isdigit():
+                        field_ids.append(int(k))
+                del data
+                gc.collect()
+
+        field_ids.sort()
+        for fid in field_ids:
+            session_id, trial_in_session = trial_field_to_session_trial(fid)
+            keys.append((subject, session_id, trial_in_session))
+    return keys
+
+
 def parse_args():
-    ap = argparse.ArgumentParser(description="Stream-preprocess SEED-VII (local volumes OR ModelScope) to npz")
+    ap = argparse.ArgumentParser(
+        description="Stream-preprocess SEED-VII (local volumes OR ModelScope) to npz "
+                    "(memory-friendly, OOM-safe)"
+    )
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--volumes-dir", help="Local directory of split volumes")
     src.add_argument("--ms-dataset", help="ModelScope dataset id (multi-volume mode)")
-    src.add_argument("--ms-single-zip", help="ModelScope dataset id (single merged zip mode; see --ms-single-zip-path)")
+    src.add_argument("--ms-single-zip", help="ModelScope dataset id (single merged zip mode)")
     src.add_argument("--mat-dir", help="Local directory of .mat files (e.g. Kaggle dataset mount)")
-    ap.add_argument("--pattern", default="*.zip.*",
-                    help="Glob for split volumes inside the source (default: *.zip.*)")
+    ap.add_argument("--pattern", default="*.zip.*")
     ap.add_argument("--ms-revision", default="master")
-    ap.add_argument("--ms-token", default="", help="ModelScope token (overrides env)")
-    ap.add_argument("--ms-scratch-dir", default="./_ms_volumes_cache",
-                    help="Where to cache downloaded volumes during streaming")
-    ap.add_argument("--ms-max-resident-volumes", type=int, default=2,
-                    help="How many split volumes are allowed on disk simultaneously")
+    ap.add_argument("--ms-token", default="")
+    ap.add_argument("--ms-scratch-dir", default="./_ms_volumes_cache")
+    ap.add_argument("--ms-max-resident-volumes", type=int, default=2)
 
-    # Single-merged-zip mode (C)
-    ap.add_argument("--ms-single-zip-path", default="SEED-VII.zip",
-                    help="Path of the merged zip inside the dataset (default: SEED-VII.zip)")
-    ap.add_argument("--ms-range-cache-mb", type=int, default=256,
-                    help="In-memory LRU range cache size when reading the merged zip (MB)")
-    ap.add_argument("--ms-range-chunk-mb", type=int, default=8,
-                    help="HTTP Range GET chunk size when reading the merged zip (MB)")
+    ap.add_argument("--ms-single-zip-path", default="SEED-VII.zip")
+    ap.add_argument("--ms-range-cache-mb", type=int, default=256)
+    ap.add_argument("--ms-range-chunk-mb", type=int, default=8)
 
-    # Local mat-dir mode (D, e.g. Kaggle)
-    ap.add_argument("--mat-pattern", default="*.mat",
-                    help="Glob for .mat files inside --mat-dir (default: *.mat)")
-    ap.add_argument("--mat-non-recursive", action="store_true",
-                    help="If set, do not recurse into subdirectories of --mat-dir")
+    ap.add_argument("--mat-pattern", default="*.mat")
+    ap.add_argument("--mat-non-recursive", action="store_true")
 
-    # save_info
-    ap.add_argument("--save-info-dir", default="",
-                    help="Local folder of save_info CSVs (continuous labels)")
-    ap.add_argument("--ms-save-info-include", default="",
-                    help="If set with --ms-dataset, download save_info CSVs matching this glob "
-                         "(e.g. 'save_info/*_save_info.csv') into --ms-scratch-dir/save_info")
+    ap.add_argument("--save-info-dir", default="")
+    ap.add_argument("--ms-save-info-include", default="")
 
     ap.add_argument("--output", required=True, help="Output .npz path")
     ap.add_argument("--subdir-keyword", default="EEG_preprocessed")
@@ -105,13 +166,18 @@ def parse_args():
                     default=str(TRAIN_DEFAULTS["split_unit"]))
     ap.add_argument("--seed", type=int, default=int(TRAIN_DEFAULTS["seed"]))
 
-    # subset
-    ap.add_argument("--only-subjects", default="", help="Comma-list of subject filenames, e.g. '1,2,3'")
+    ap.add_argument("--only-subjects", default="")
+
+    # NEW: memory-safety knobs
+    ap.add_argument("--tmp-dir", default="",
+                    help="Where to place the on-disk memmap shard (default: alongside --output)")
+    ap.add_argument("--compress", action="store_true",
+                    help="If set, write the final npz with np.savez_compressed (slower, extra RAM). "
+                         "Default: np.savez (uncompressed, almost zero extra RAM).")
     return ap.parse_args()
 
 
 def _make_iter(args):
-    """Factory returning a function `() -> iterator of RawTrial` for two passes."""
     only = list(args.only_subjects.split(",")) if args.only_subjects else None
     if args.mat_dir:
         def _it():
@@ -185,6 +251,13 @@ def main():
     cfg["max_windows_per_trial"] = args.max_windows_per_trial
     cfg["use_ica"] = bool(args.use_ica)
     cfg["use_car"] = not bool(args.no_car)
+    # Hint preprocess to avoid float64 copies where safe.
+    cfg.setdefault("inplace", True)
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(args.tmp_dir) if args.tmp_dir else out_path.parent
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- intensities ----
     intensities: Dict[Tuple[str, int, int], float] = {}
@@ -193,20 +266,35 @@ def main():
         intensities = load_save_info_intensity(save_info_dir)
         print(f"[INFO] loaded {len(intensities)} continuous labels from {save_info_dir}")
     else:
-        print("[WARN] No save_info provided; defaulting intensities to "
-              f"{args.default_intensity}")
+        print(f"[WARN] No save_info; defaulting intensities to {args.default_intensity}")
 
-    iter_factory = _make_iter(args)
+    # ---- Pass 1 (LIGHT): enumerate keys without loading EEG ----
+    print("[INFO] Pass 1 (light): enumerating trial keys without loading EEG ...")
+    only = list(args.only_subjects.split(",")) if args.only_subjects else None
+    if args.mat_dir:
+        triples = _light_enumerate_trial_keys_from_mat_dir(
+            args.mat_dir, args.mat_pattern, only,
+            recursive=not bool(args.mat_non_recursive),
+        )
+    else:
+        # For non-mat sources we still need the original (heavy) enumeration.
+        print("[INFO] non --mat-dir source: falling back to full Pass-1 enumeration "
+              "(still memory-friendly because each trial is released immediately).")
+        triples = []
+        iter_factory_pre = _make_iter(args)
+        for trial in iter_factory_pre():
+            triples.append((trial.subject, trial.session_id, trial.trial_id))
+            # drop the EEG payload ASAP
+            try:
+                del trial
+            except Exception:
+                pass
+        gc.collect()
 
-    # ---- pass 1: enumerate trial keys & labels (needed for stratified split) ----
-    print("[INFO] Pass 1: enumerating trial keys & labels ...")
-    trial_keys: List[TrialKey] = []
-    trial_labels: List[int] = []
-    for trial in iter_factory():
-        code = trial_id_to_emotion(trial.session_id, trial.trial_id)
-        y = EMOTION_TO_IDX[code]
-        trial_keys.append(TrialKey(trial.subject, trial.session_id, trial.trial_id))
-        trial_labels.append(y)
+    trial_keys: List[TrialKey] = [TrialKey(s, ss, tt) for (s, ss, tt) in triples]
+    trial_labels: List[int] = [
+        EMOTION_TO_IDX[trial_id_to_emotion(ss, tt)] for (_, ss, tt) in triples
+    ]
     print(f"[INFO] total trials enumerated: {len(trial_keys)}")
 
     train_keys, val_keys, test_keys = split_trials(
@@ -220,20 +308,41 @@ def main():
     for k in test_keys:  key_to_split[k.as_tuple()] = "test"
     print(f"[INFO] split trials: train={len(train_keys)} val={len(val_keys)} test={len(test_keys)}")
 
-    # ---- pass 2: stream + preprocess ----
-    X_list: List[np.ndarray] = []
-    y_list: List[int] = []
-    s_list: List[float] = []
+    # ---- Geometry for the memmap shard ----
+    fs = int(cfg["fs"])
+    win_samples = int(round(float(cfg["window_seconds"]) * fs))
+    max_wpt = int(cfg["max_windows_per_trial"])
+    cap = len(trial_keys) * max_wpt   # absolute upper bound on N
+    shard_path = tmp_dir / (out_path.stem + ".X.f32.memmap")
+    print(f"[INFO] reserving memmap shard: shape=({cap},62,{win_samples}) "
+          f"≈ {cap * 62 * win_samples * 4 / 1024**3:.2f} GB at {shard_path}")
+    X_mm = np.memmap(shard_path, dtype=np.float32, mode="w+",
+                     shape=(cap, 62, win_samples))
+
+    y_arr = np.empty((cap,), dtype=np.int64)
+    s_arr = np.empty((cap,), dtype=np.float32)
     meta_list: List[dict] = []
     split_indices: Dict[str, List[int]] = {"train": [], "val": [], "test": []}
 
-    print("[INFO] Pass 2: streaming + preprocessing ...")
+    n_written = 0
+    flush_every_trials = 25  # periodically flush memmap to keep dirty pages bounded
+
+    # ---- Pass 2: stream + preprocess + write straight to memmap ----
+    print("[INFO] Pass 2: streaming + preprocessing -> memmap ...")
+    iter_factory = _make_iter(args)
     pbar = tqdm(iter_factory(), total=len(trial_keys))
+    seen_trials = 0
     for trial in pbar:
         key_t = (trial.subject, trial.session_id, trial.trial_id)
         split_name = key_to_split.get(key_t)
         if split_name is None:
+            # release EEG and continue
+            try:
+                del trial
+            except Exception:
+                pass
             continue
+
         code = trial_id_to_emotion(trial.session_id, trial.trial_id)
         y_idx = EMOTION_TO_IDX[code]
         s_val = float(intensities.get(key_t, args.default_intensity))
@@ -247,39 +356,104 @@ def main():
             intensity=s_val,
             cfg=cfg,
         )
-        if arr.shape[0] == 0:
+        # Drop the raw EEG payload immediately
+        try:
+            trial.eeg = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        del trial
+
+        n = int(arr.shape[0])
+        if n == 0:
+            del arr, metas
             continue
 
-        start_idx = len(y_list)
-        for i in range(arr.shape[0]):
-            X_list.append(arr[i:i+1])
-            y_list.append(y_idx)
-            s_list.append(s_val)
+        # Bounds check (should not trigger because cap = trials * max_wpt)
+        if n_written + n > cap:
+            raise RuntimeError(
+                f"memmap overflow: trying to write {n} more rows past cap={cap}. "
+                "Did you change max_windows_per_trial mid-run?"
+            )
+
+        # *** Copy into memmap and immediately release `arr` (no view-pinning) ***
+        X_mm[n_written:n_written + n] = arr  # numpy will downcast to f32 as needed
+        y_arr[n_written:n_written + n] = y_idx
+        s_arr[n_written:n_written + n] = s_val
+
+        start_idx = n_written
+        for i in range(n):
             m = metas[i].__dict__.copy()
             m["split"] = split_name
             m["emotion_code"] = code
             meta_list.append(m)
-        end_idx = len(y_list)
+        end_idx = start_idx + n
         split_indices[split_name].extend(range(start_idx, end_idx))
+        n_written = end_idx
 
-        pbar.set_postfix({"subj": trial.subject, "sess": trial.session_id,
-                          "trial": trial.trial_id, "n": end_idx - start_idx,
-                          "split": split_name})
+        pbar.set_postfix({"n_total": n_written, "split": split_name})
         del arr, metas
 
-    if not X_list:
+        seen_trials += 1
+        if seen_trials % flush_every_trials == 0:
+            X_mm.flush()
+            gc.collect()
+
+    if n_written == 0:
+        del X_mm
+        try:
+            shard_path.unlink()
+        except Exception:
+            pass
         raise RuntimeError("No windows produced. Check source / pattern / save_info.")
 
-    X = np.concatenate(X_list, axis=0)
-    y = np.asarray(y_list, dtype=np.int64)
-    s = np.asarray(s_list, dtype=np.float32)
-    splits = {k: np.asarray(v, dtype=np.int64) for k, v in split_indices.items()}
+    X_mm.flush()
 
-    print(f"[INFO] final: X={X.shape}, y={y.shape}, s={s.shape}, "
+    # ---- Finalize: write npz WITHOUT a giant in-RAM concatenate ----
+    y_final = y_arr[:n_written]
+    s_final = s_arr[:n_written]
+    splits = {k: np.asarray(v, dtype=np.int64) for k, v in split_indices.items()}
+    meta_arr = np.asarray(
+        [json.dumps(m, ensure_ascii=True) for m in meta_list], dtype=object
+    )
+
+    # Re-open the shard as a *read-only* memmap of the actually-used prefix so
+    # np.savez can pull rows directly off disk without doubling memory.
+    del X_mm
+    gc.collect()
+    X_view = np.memmap(shard_path, dtype=np.float32, mode="r",
+                       shape=(cap, 62, win_samples))[:n_written]
+
+    print(f"[INFO] final: X={X_view.shape}, y={y_final.shape}, s={s_final.shape}, "
           f"train/val/test={len(splits['train'])}/{len(splits['val'])}/{len(splits['test'])}")
 
-    save_dataset_npz(args.output, X, y, s, meta_list, split_assignment=splits)
-    print(f"[OK] saved -> {args.output}")
+    payload = {
+        "X": X_view,        # memmap-backed; np.savez streams it out
+        "y": y_final,
+        "s": s_final,
+        "meta": meta_arr,
+    }
+    for k, v in splits.items():
+        payload[f"split_{k}"] = v
+
+    print(f"[INFO] writing npz -> {out_path}  (compress={args.compress})")
+    if args.compress:
+        # Compression DOES allocate per-array buffers internally; keep this off
+        # on tight-RAM machines. We still avoid the 2x duplicate of the original
+        # bug because X is already on disk (memmap).
+        np.savez_compressed(out_path, **payload)
+    else:
+        np.savez(out_path, **payload)
+
+    # Cleanup the temporary memmap shard.
+    del X_view
+    gc.collect()
+    try:
+        shard_path.unlink()
+        print(f"[OK] removed temp shard {shard_path}")
+    except Exception as e:
+        print(f"[WARN] could not delete shard {shard_path}: {e}")
+
+    print(f"[OK] saved -> {out_path}")
 
 
 if __name__ == "__main__":

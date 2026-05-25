@@ -65,8 +65,8 @@ TRAIN_DEFAULTS: Dict[str, object] = {
     "device": "auto",
     "amp": True,
     "seed": 42,
-    "batch_size": 64,
-    "num_workers": 0,
+    "batch_size": 256,
+    "num_workers": 6,
 
     # 优化器
     "optimizer": "adam",
