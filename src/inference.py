@@ -1,4 +1,4 @@
-"""Encoder inference: dump 256-d embeddings + class predictions + intensity predictions."""
+"""Encoder inference: dump embeddings + class predictions + intensity predictions."""
 from __future__ import annotations
 
 import json
@@ -9,9 +9,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from .config import CONFORMER_CONFIG
+from .config import EEGNET_CONFIG
 from .dataset import EEGWindowArrayDataset, load_dataset_npz
-from .model import EEGConformerDualHead
+from .model import EEGNetDualHead
 from .trainer import resolve_device
 
 
@@ -37,10 +37,7 @@ def encode_npz(
     use_amp: bool = False,
     subset: Optional[str] = None,
 ) -> None:
-    """Encode windows in `data_path` using a trained checkpoint.
-
-    subset: None or one of {"train","val","test"} -> only encode that split (if baked in).
-    """
+    """Encode windows in `data_path` using a trained checkpoint."""
     device = resolve_device(device_arg)
     use_amp = bool(use_amp and device.type == "cuda")
 
@@ -50,16 +47,24 @@ def encode_npz(
         x = x[sel]; y = y[sel]; s = s[sel]
         meta = [meta[i] for i in sel.tolist()]
 
-    model = EEGConformerDualHead().to(device)
+    model = EEGNetDualHead(
+        Chans=EEGNET_CONFIG["n_channels"],
+        Samples=EEGNET_CONFIG["n_timepoints"],
+        F1=EEGNET_CONFIG["F1"],
+        D=EEGNET_CONFIG["D"],
+        F2=EEGNET_CONFIG["F2"],
+        kernLength=EEGNET_CONFIG["kernLength"],
+        dropout=EEGNET_CONFIG["dropout"],
+        nb_classes=EEGNET_CONFIG["n_classes"],
+        int_hidden=EEGNET_CONFIG["intensity_head_hidden"],
+    ).to(device)
     ck = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ck["model"])
     model.eval()
 
     ds = _EEGOnly(x)
-    loader = DataLoader(
-        ds, batch_size=batch_size, shuffle=False, num_workers=0,
-        pin_memory=torch.cuda.is_available(),
-    )
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0,
+                        pin_memory=torch.cuda.is_available())
 
     feats: List[np.ndarray] = []
     cls_preds: List[np.ndarray] = []

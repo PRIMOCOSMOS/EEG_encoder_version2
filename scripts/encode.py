@@ -13,7 +13,7 @@ from src.inference import encode_npz  # noqa: E402
 
 
 def main():
-    p = argparse.ArgumentParser(description="Encode SEED-VII windows with trained EEG-Conformer")
+    p = argparse.ArgumentParser(description="Encode SEED-VII windows with trained EEGNet")
     p.add_argument("--data", required=True, help="preprocessed npz")
     p.add_argument("--checkpoint", required=True, help="best_encoder.pt or best_model.pt")
     p.add_argument("--output", required=True, help="output .npz")

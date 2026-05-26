@@ -34,12 +34,10 @@ class EEGNetBlock1(nn.Module):
     def __init__(self, F1: int = 8, D: int = 2, Chans: int = 62,
                  kernLength: int = 100, dropout: float = 0.5):
         super().__init__()
-        # Temporal convolution (1D along time axis)
         self.temporal_conv = nn.Conv2d(
             in_channels=1, out_channels=F1,
             kernel_size=(1, kernLength), padding=(0, kernLength // 2), bias=False
         )
-        # Depthwise spatial convolution (across channels)
         self.depthwise_conv = nn.Conv2d(
             in_channels=F1, out_channels=F1 * D,
             kernel_size=(Chans, 1), groups=F1, bias=False
@@ -62,12 +60,10 @@ class EEGNetBlock2(nn.Module):
     """Block 2: Separable convolution (spatial → temporal refinement)."""
     def __init__(self, F1: int = 8, D: int = 2, F2: int = 16, dropout: float = 0.5):
         super().__init__()
-        # Depthwise convolution (spatial patterns)
         self.depthwise = nn.Conv2d(
             in_channels=F1 * D, out_channels=F1 * D,
             kernel_size=(1, 16), groups=F1 * D, bias=False
         )
-        # Pointwise convolution (temporal combination)
         self.pointwise = nn.Conv2d(
             in_channels=F1 * D, out_channels=F2, kernel_size=1, bias=False
         )

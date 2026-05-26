@@ -1,4 +1,4 @@
-"""Training loop for SEED-VII dual-head EEG-Conformer.
+"""Training loop for SEED-VII EEGNet dual-head model.
 
 OOM 终极修复策略（v4）：
 1. ensure_mmap_format()：一次性将压缩 npz 拆为 X.npy + meta.npz
@@ -24,12 +24,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from .config import CONFORMER_CONFIG, TRAIN_DEFAULTS
+from .config import EEGNET_CONFIG, TRAIN_DEFAULTS
 from .dataset import (
     EEGWindowArrayDataset, filter_by_subjects, load_dataset_mmap,
 )
 from .losses import LossConfig, WeightedDualLoss
-from .model import EEGConformerDualHead, count_parameters, freeze_intensity_head
+from .model import EEGNetDualHead, count_parameters, freeze_intensity_head
 
 # ---------------------------------------------------------------------------
 # Config
@@ -77,6 +77,7 @@ class TrainConfig:
     train_subjects: str = str(TRAIN_DEFAULTS.get("train_subjects", ""))
     val_subjects: str = str(TRAIN_DEFAULTS.get("val_subjects", ""))
     test_subjects: str = str(TRAIN_DEFAULTS.get("test_subjects", ""))
+    model_type: str = str(TRAIN_DEFAULTS.get("model_type", "eegnet"))
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -187,8 +188,9 @@ def save_state(path, epoch, model, optimizer, scaler, bv, be, bad, rse, ti, vi, 
                 "train_idx": ti, "val_idx": vi, "test_idx": tsi,
                 "config": asdict(cfg) | {"data_path": str(cfg.data_path), "output_dir": str(cfg.output_dir)}}, path)
 
-def save_encoder(path, model):
-    torch.save({"model": model.state_dict(), "config": CONFORMER_CONFIG}, path)
+def save_encoder(path, model, config_dict):
+    """保存编码器（支持 EEGNet 和 Conformer 配置）"""
+    torch.save({"model": model.state_dict(), "config": config_dict}, path)
 
 # ---------------------------------------------------------------------------
 # DataLoader
@@ -208,11 +210,58 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     device = resolve_device(cfg.device); use_amp = bool(cfg.amp and device.type == "cuda")
 
     # ================================================================
+    # STEP 0: 构建模型
+    # ================================================================
+    if cfg.model_type == "eegnet":
+        model = EEGNetDualHead(
+            Chans=EEGNET_CONFIG["n_channels"],
+            Samples=EEGNET_CONFIG["n_timepoints"],
+            F1=EEGNET_CONFIG["F1"],
+            D=EEGNET_CONFIG["D"],
+            F2=EEGNET_CONFIG["F2"],
+            kernLength=EEGNET_CONFIG["kernLength"],
+            dropout=EEGNET_CONFIG["dropout"],
+            nb_classes=EEGNET_CONFIG["n_classes"],
+            int_hidden=EEGNET_CONFIG["intensity_head_hidden"],
+        )
+        active_config = EEGNET_CONFIG
+        logger.info(f"[MODEL] EEGNet (F1={EEGNET_CONFIG['F1']}, D={EEGNET_CONFIG['D']}, "
+                     f"F2={EEGNET_CONFIG['F2']}, kernLength={EEGNET_CONFIG['kernLength']})")
+    else:
+        # 向后兼容：conformer 模式也使用 EEGNet（因为 Conformer 已被替换）
+        model = EEGNetDualHead(
+            Chans=EEGNET_CONFIG["n_channels"],
+            Samples=EEGNET_CONFIG["n_timepoints"],
+            F1=EEGNET_CONFIG["F1"],
+            D=EEGNET_CONFIG["D"],
+            F2=EEGNET_CONFIG["F2"],
+            kernLength=EEGNET_CONFIG["kernLength"],
+            dropout=EEGNET_CONFIG["dropout"],
+            nb_classes=EEGNET_CONFIG["n_classes"],
+            int_hidden=EEGNET_CONFIG["intensity_head_hidden"],
+        )
+        active_config = EEGNET_CONFIG
+        logger.info(f"[MODEL] EEGNet (conformer mode requested, using eegnet)")
+
+    model = model.to(device)
+
+    if cfg.freeze_intensity_head:
+        nf = freeze_intensity_head(model)
+        n_params = count_parameters(model)
+        logger.info(f"[FREEZE] {nf:,} frozen, {n_params:,} trainable")
+    else:
+        n_params = count_parameters(model)
+        logger.info(f"[MODEL] Params={n_params:,} ({n_params/1e6:.4f}M)")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr,
+                                betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    # ================================================================
     # STEP 1: mmap 加载 —— X 零 RAM，只加载 y/s/meta（很小）
     # ================================================================
     _log_mem(logger, "before-load")
 
-    # 先只加载 meta 来确定需要哪些 indices
     x_full, y_full, s_full, meta, splits_or_map = load_dataset_mmap(cfg.data_path)
     n_total = len(y_full)
     x_shape = x_full.shape
@@ -273,18 +322,16 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
 
     # ================================================================
     # STEP 3: 只把需要的行从 mmap 拷贝进 RAM
-    # 单被试训练: ~600MB，全量训练: ~12GB（如果全量也 OOM 则需减少被试）
     # ================================================================
     all_needed = np.sort(np.unique(np.concatenate([train_idx, val_idx, test_idx])))
     subset_gb = len(all_needed) * x_shape[1] * x_shape[2] * 4 / 1024**3
     logger.info(f"Copying {len(all_needed)}/{n_total} rows into RAM (~{subset_gb:.2f} GB)...")
 
-    x_sub = np.array(x_full[all_needed], dtype=np.float32)   # 从 mmap 读取，写进 RAM
+    x_sub = np.array(x_full[all_needed], dtype=np.float32)
     y_sub = np.array(y_full[all_needed])
     s_sub = np.array(s_full[all_needed])
     meta_sub = [meta[i] for i in all_needed]
 
-    # 释放 mmap + 全量小数组
     del x_full, y_full, s_full, meta, splits_or_map
     gc.collect()
     _log_mem(logger, "after-subset-copy")
@@ -305,29 +352,14 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     val_ds   = EEGWindowArrayDataset(x_sub, y_sub, s_sub, indices=val_idx_local)
     test_ds  = EEGWindowArrayDataset(x_sub, y_sub, s_sub, indices=test_idx_local) if len(test_idx_local) > 0 else None
 
-    nw = min(cfg.num_workers, 2)  # 硬限制：最多 2 workers
+    nw = min(cfg.num_workers, 2)
     train_loader = make_loader(train_ds, cfg.batch_size, True, nw)
     val_loader   = make_loader(val_ds, cfg.batch_size, False, nw)
     test_loader  = make_loader(test_ds, cfg.batch_size, False, nw) if test_ds else None
 
-    del x_sub, y_sub, s_sub  # Dataset 已持有 tensor，释放 numpy 引用
+    del x_sub, y_sub, s_sub
     gc.collect()
     _log_mem(logger, "after-dataset")
-
-    # ================================================================
-    # STEP 5: 模型
-    # ================================================================
-    model = EEGConformerDualHead().to(device)
-    if cfg.freeze_intensity_head:
-        nf = freeze_intensity_head(model); n_params = count_parameters(model)
-        logger.info(f"[FREEZE] {nf:,} frozen, {n_params:,} trainable ({n_params/1e6:.3f}M)")
-    else:
-        n_params = count_parameters(model)
-        logger.info(f"Model params={n_params/1e6:.3f}M")
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr,
-                                betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # ---- paths ----
     state_path = Path(cfg.resume_path) if cfg.resume_path else (cfg.output_dir / "train_state.pt")
@@ -356,7 +388,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     deadline_ts = t0 + cfg.max_runtime_hours * 3600.0 if cfg.max_runtime_hours > 0 else None
 
     # ================================================================
-    # STEP 6: 训练循环
+    # STEP 5: 训练循环
     # ================================================================
     last_epoch = start_epoch - 1
     for epoch in range(start_epoch, cfg.max_epochs + 1):
@@ -389,8 +421,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
 
         if va["acc"] > best_val_acc:
             best_val_acc, best_epoch, bad_epochs = va["acc"], epoch, 0
-            torch.save({"model": model.state_dict(), "config": CONFORMER_CONFIG, "val": va}, best_model_path)
-            save_encoder(best_encoder_path, model)
+            torch.save({"model": model.state_dict(), "config": active_config, "val": va}, best_model_path)
+            save_encoder(best_encoder_path, model, active_config)
         else:
             bad_epochs += 1
 
@@ -402,7 +434,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             logger.info(f"[EARLY-STOP] @{epoch}, best={best_val_acc:.4f} @{best_epoch}"); break
 
     if cfg.save_last:
-        torch.save({"model": model.state_dict(), "config": CONFORMER_CONFIG, "epoch": last_epoch},
+        torch.save({"model": model.state_dict(), "config": active_config, "epoch": last_epoch},
                     cfg.output_dir / "last_model.pt")
 
     test_metrics = {}
@@ -414,6 +446,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     summary = {"best_val_acc": best_val_acc, "best_epoch": best_epoch, "test": test_metrics,
                "n_params": int(n_params), "epochs_run": int(last_epoch),
                "elapsed_seconds": float(time.time() - t0),
+               "model_type": cfg.model_type,
                "freeze_intensity_head": cfg.freeze_intensity_head,
                "train_subjects": cfg.train_subjects, "val_subjects": cfg.val_subjects,
                "test_subjects": cfg.test_subjects}
