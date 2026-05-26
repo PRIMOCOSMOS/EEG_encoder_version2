@@ -1,20 +1,10 @@
 """Training loop for SEED-VII dual-head EEG-Conformer.
 
-特性（覆盖 Design.md 全部代码原则）：
-- 两阶段训练：(1) 仅 L_cls 预训练 N epochs；(2) 联合训练 L_cls + L_reg (+L_rank)。
-- 冻结 Intensity Head 选项（freeze_intensity_head），只训练分类分支。
-- 单被试训练 + 跨被试验证（train_subjects / val_subjects / test_subjects）。
-- 余弦退火 (lr_max -> 1e-5)。
-- 周期断点 (`train_state.pt`) + `--resume`。
-- 软超时 (`--max-runtime-hours`)。
-- AMP 混合精度（CUDA）。
-- 早停（基于验证集分类准确率）。
-
-OOM 修复（v3）：
-- 索引式 Dataset：不复制子数组，所有 split 共享一份底层 x/y/s（~2X → ~1X 内存）
-- 关闭 npz 文件释放解压缓冲区
-- DataLoader：persistent_workers=False / pin_memory=False（避免 COW + 锁页开销）
-- 积极释放：创建 dataset 后 del 原始 numpy 数组 + gc.collect()
+OOM 终极修复策略（v4）：
+1. ensure_mmap_format()：一次性将压缩 npz 拆为 X.npy + meta.npz
+2. load_dataset_mmap()：X 用 mmap 加载（零 RAM），只加载 y/s/meta
+3. 确定需要的 indices 后，只把子集拷贝进 RAM（单被试 ~600MB vs 全量 ~12GB）
+4. Dataset 用连续内存子集创建，DataLoader shuffle 高效
 """
 from __future__ import annotations
 
@@ -25,7 +15,7 @@ import math
 import os
 import random
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -35,12 +25,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from .config import CONFORMER_CONFIG, TRAIN_DEFAULTS
-from .dataset import EEGWindowArrayDataset, filter_by_subjects
+from .dataset import (
+    EEGWindowArrayDataset, filter_by_subjects, load_dataset_mmap,
+)
 from .losses import LossConfig, WeightedDualLoss
 from .model import EEGConformerDualHead, count_parameters, freeze_intensity_head
 
 # ---------------------------------------------------------------------------
-# Config & helpers
+# Config
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -56,12 +48,9 @@ class TrainConfig:
     beta2: float = float(TRAIN_DEFAULTS["beta2"])
     weight_decay: float = float(TRAIN_DEFAULTS["weight_decay"])
     grad_clip: float = float(TRAIN_DEFAULTS["grad_clip"])
-
     pretrain_epochs: int = int(TRAIN_DEFAULTS["pretrain_epochs"])
     max_epochs: int = int(TRAIN_DEFAULTS["max_epochs"])
     patience: int = int(TRAIN_DEFAULTS["patience"])
-
-    # loss
     alpha_cls: float = float(TRAIN_DEFAULTS["alpha_cls_start"])
     beta_reg: float = float(TRAIN_DEFAULTS["beta_reg_start"])
     gamma_rank_start: float = float(TRAIN_DEFAULTS["gamma_rank_start"])
@@ -73,7 +62,6 @@ class TrainConfig:
     sample_weight_mode: str = str(TRAIN_DEFAULTS["sample_weight_mode"])
     intensity_threshold: float = float(TRAIN_DEFAULTS["intensity_threshold"])
     weak_sample_weight: float = float(TRAIN_DEFAULTS["weak_sample_weight"])
-
     device: str = str(TRAIN_DEFAULTS["device"])
     amp: bool = bool(TRAIN_DEFAULTS["amp"])
     save_last: bool = bool(TRAIN_DEFAULTS["save_last"])
@@ -83,291 +71,180 @@ class TrainConfig:
     resume_path: str = ""
     save_interval: int = int(TRAIN_DEFAULTS["save_interval"])
     max_runtime_hours: float = float(TRAIN_DEFAULTS["max_runtime_hours"])
-
-    # ---- DataLoader OOM 修复 ----
     pin_memory: bool = bool(TRAIN_DEFAULTS.get("pin_memory", False))
     persistent_workers: bool = bool(TRAIN_DEFAULTS.get("persistent_workers", False))
-
-    # ---- 过拟合缓解 ----
     freeze_intensity_head: bool = bool(TRAIN_DEFAULTS.get("freeze_intensity_head", False))
     train_subjects: str = str(TRAIN_DEFAULTS.get("train_subjects", ""))
     val_subjects: str = str(TRAIN_DEFAULTS.get("val_subjects", ""))
     test_subjects: str = str(TRAIN_DEFAULTS.get("test_subjects", ""))
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def resolve_device(device_arg: str) -> torch.device:
-    if device_arg == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device_arg == "cuda" and not torch.cuda.is_available():
-        print("[WARN] CUDA requested but unavailable, fallback to CPU.")
-        return torch.device("cpu")
-    return torch.device(device_arg)
+def set_seed(seed):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False
 
-def optimizer_to(opt: torch.optim.Optimizer, device: torch.device) -> None:
-    for state in opt.state.values():
-        for k, v in state.items():
-            if torch.is_tensor(v):
-                state[k] = v.to(device)
+def resolve_device(d):
+    if d == "auto": return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if d == "cuda" and not torch.cuda.is_available():
+        print("[WARN] No CUDA, fallback CPU."); return torch.device("cpu")
+    return torch.device(d)
 
-def setup_logger(output_dir: Path) -> logging.Logger:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("seed_vii_trainer")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+def optimizer_to(opt, device):
+    for st in opt.state.values():
+        for k, v in st.items():
+            if torch.is_tensor(v): st[k] = v.to(device)
+
+def setup_logger(od):
+    od = Path(od); od.mkdir(parents=True, exist_ok=True)
+    lg = logging.getLogger("seed_vii_trainer"); lg.setLevel(logging.INFO); lg.handlers.clear()
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    fh = logging.FileHandler(output_dir / "train.log", encoding="utf-8")
-    fh.setFormatter(fmt)
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    logger.addHandler(fh)
-    logger.addHandler(sh)
-    return logger
+    fh = logging.FileHandler(od / "train.log", encoding="utf-8"); fh.setFormatter(fmt)
+    sh = logging.StreamHandler(); sh.setFormatter(fmt)
+    lg.addHandler(fh); lg.addHandler(sh); return lg
+
+def cosine_lr(ep, tot, base, mn):
+    if tot <= 1: return base
+    return mn + (base - mn) * 0.5 * (1.0 + math.cos(math.pi * ep / max(1, tot - 1)))
+
+def gamma_schedule(ep, cfg, started):
+    if not cfg.enable_rank: return 0.0
+    if cfg.rank_warmup_epochs <= 0: return cfg.gamma_rank_end
+    p = min(1.0, max(0.0, max(0, ep - started) / float(cfg.rank_warmup_epochs)))
+    return cfg.gamma_rank_start + (cfg.gamma_rank_end - cfg.gamma_rank_start) * p
+
+def _parse_subjects(s): return [p.strip() for p in s.split(",") if p.strip()]
+
+def _log_mem(logger, label=""):
+    try:
+        import psutil
+        logger.info(f"[MEM {label}] RSS={psutil.Process().memory_info().rss/1024**3:.2f}GB")
+    except ImportError: pass
 
 # ---------------------------------------------------------------------------
-# Scheduling
+# Loss / train / eval
 # ---------------------------------------------------------------------------
 
-def cosine_lr(epoch: int, total_epochs: int, base_lr: float, min_lr: float) -> float:
-    if total_epochs <= 1:
-        return base_lr
-    cos = 0.5 * (1.0 + math.cos(math.pi * epoch / max(1, total_epochs - 1)))
-    return min_lr + (base_lr - min_lr) * cos
-
-def gamma_schedule(epoch: int, cfg: TrainConfig, started_at_epoch: int) -> float:
-    if not cfg.enable_rank:
-        return 0.0
-    if cfg.rank_warmup_epochs <= 0:
-        return cfg.gamma_rank_end
-    progress = max(0, epoch - started_at_epoch) / float(cfg.rank_warmup_epochs)
-    progress = min(1.0, max(0.0, progress))
-    return cfg.gamma_rank_start + (cfg.gamma_rank_end - cfg.gamma_rank_start) * progress
-
-# ---------------------------------------------------------------------------
-# Train / eval
-# ---------------------------------------------------------------------------
-
-def build_loss(cfg: TrainConfig, gamma: float, enable_rank: bool) -> WeightedDualLoss:
-    return WeightedDualLoss(LossConfig(
-        alpha=cfg.alpha_cls,
-        beta=cfg.beta_reg,
-        gamma=gamma,
-        label_smoothing=cfg.label_smoothing,
-        rank_margin=cfg.rank_margin,
-        enable_rank=enable_rank,
-        sample_weight_mode=cfg.sample_weight_mode,
-        intensity_threshold=cfg.intensity_threshold,
-        weak_sample_weight=cfg.weak_sample_weight,
-    ))
+def build_loss(cfg, gamma, enable_rank):
+    return WeightedDualLoss(LossConfig(alpha=cfg.alpha_cls, beta=cfg.beta_reg, gamma=gamma,
+        label_smoothing=cfg.label_smoothing, rank_margin=cfg.rank_margin, enable_rank=enable_rank,
+        sample_weight_mode=cfg.sample_weight_mode, intensity_threshold=cfg.intensity_threshold,
+        weak_sample_weight=cfg.weak_sample_weight))
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, criterion: WeightedDualLoss,
-             device: torch.device, use_amp: bool) -> Dict[str, float]:
+def evaluate(model, loader, criterion, device, use_amp):
     model.eval()
-    losses, cls_losses, reg_losses = [], [], []
-    correct = total = 0
-    abs_err = 0.0
+    losses, cls_l, reg_l = [], [], []
+    correct = total = 0; abs_err = 0.0
     for xb, yb, sb in loader:
-        xb = xb.to(device, non_blocking=True)
-        yb = yb.to(device, non_blocking=True)
-        sb = sb.to(device, non_blocking=True)
+        xb, yb, sb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True), sb.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, enabled=use_amp):
-            logits, pred_s, _ = model(xb)
-            total_loss, parts = criterion(logits, pred_s, yb, sb)
-        losses.append(parts["loss"])
-        cls_losses.append(parts["cls"])
-        reg_losses.append(parts["reg"])
-        pred = logits.argmax(dim=1)
-        correct += (pred == yb).sum().item()
-        total += yb.numel()
-        abs_err += (pred_s - sb).abs().sum().item()
+            logits, ps, _ = model(xb); tl, parts = criterion(logits, ps, yb, sb)
+        losses.append(parts["loss"]); cls_l.append(parts["cls"]); reg_l.append(parts["reg"])
+        pred = logits.argmax(1); correct += (pred == yb).sum().item(); total += yb.numel()
+        abs_err += (ps - sb).abs().sum().item()
     n = max(1, total)
-    return {
-        "loss": float(np.mean(losses)),
-        "cls": float(np.mean(cls_losses)),
-        "reg": float(np.mean(reg_losses)),
-        "acc": correct / n,
-        "intensity_mae": abs_err / n,
-    }
+    return {"loss": float(np.mean(losses)), "cls": float(np.mean(cls_l)),
+            "reg": float(np.mean(reg_l)), "acc": correct / n, "intensity_mae": abs_err / n}
 
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: WeightedDualLoss,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
-    device: torch.device,
-    use_amp: bool,
-    grad_clip: float,
-    deadline_ts: Optional[float] = None,
-) -> Tuple[Dict[str, float], bool]:
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_amp, grad_clip, deadline_ts=None):
     model.train()
-    losses, cls_losses, reg_losses, rank_losses = [], [], [], []
-    correct = total = 0
-    deadline_hit = False
+    losses, cls_l, reg_l, rank_l = [], [], [], []
+    correct = total = 0; hit = False
     for xb, yb, sb in loader:
-        if deadline_ts is not None and time.time() >= deadline_ts:
-            deadline_hit = True
-            break
-        xb = xb.to(device, non_blocking=True)
-        yb = yb.to(device, non_blocking=True)
-        sb = sb.to(device, non_blocking=True)
+        if deadline_ts and time.time() >= deadline_ts: hit = True; break
+        xb, yb, sb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True), sb.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=use_amp):
-            logits, pred_s, _ = model(xb)
-            loss, parts = criterion(logits, pred_s, yb, sb)
+            logits, ps, _ = model(xb); loss, parts = criterion(logits, ps, yb, sb)
         if use_amp:
             scaler.scale(loss).backward()
-            if grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            if grad_clip > 0: scaler.unscale_(optimizer); torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer); scaler.update()
         else:
             loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            if grad_clip > 0: torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-        losses.append(parts["loss"])
-        cls_losses.append(parts["cls"])
-        reg_losses.append(parts["reg"])
-        rank_losses.append(parts["rank"])
-        pred = logits.argmax(dim=1)
-        correct += (pred == yb).sum().item()
-        total += yb.numel()
+        losses.append(parts["loss"]); cls_l.append(parts["cls"]); reg_l.append(parts["reg"]); rank_l.append(parts["rank"])
+        correct += (logits.argmax(1) == yb).sum().item(); total += yb.numel()
     n = max(1, total)
-    metrics = {
-        "loss": float(np.mean(losses)) if losses else float("nan"),
-        "cls": float(np.mean(cls_losses)) if cls_losses else float("nan"),
-        "reg": float(np.mean(reg_losses)) if reg_losses else float("nan"),
-        "rank": float(np.mean(rank_losses)) if rank_losses else 0.0,
-        "acc": correct / n,
-    }
-    return metrics, deadline_hit
+    return {"loss": float(np.mean(losses)) if losses else float("nan"),
+            "cls": float(np.mean(cls_l)) if cls_l else float("nan"),
+            "reg": float(np.mean(reg_l)) if reg_l else float("nan"),
+            "rank": float(np.mean(rank_l)) if rank_l else 0.0, "acc": correct / n}, hit
 
 # ---------------------------------------------------------------------------
 # Checkpoint I/O
 # ---------------------------------------------------------------------------
 
-def save_train_state(
-    path: Path,
-    epoch: int,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
-    best_val_acc: float,
-    best_epoch: int,
-    bad_epochs: int,
-    rank_started_at_epoch: int,
-    train_idx: np.ndarray,
-    val_idx: np.ndarray,
-    test_idx: np.ndarray,
-    cfg: TrainConfig,
-) -> None:
-    state = {
-        "epoch": int(epoch),
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
-        "best_val_acc": float(best_val_acc),
-        "best_epoch": int(best_epoch),
-        "bad_epochs": int(bad_epochs),
-        "rank_started_at_epoch": int(rank_started_at_epoch),
-        "train_idx": train_idx,
-        "val_idx": val_idx,
-        "test_idx": test_idx,
-        "config": asdict(cfg) | {"data_path": str(cfg.data_path), "output_dir": str(cfg.output_dir)},
-    }
-    torch.save(state, path)
+def save_state(path, epoch, model, optimizer, scaler, bv, be, bad, rse, ti, vi, tsi, cfg):
+    torch.save({"epoch": int(epoch), "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict(), "best_val_acc": float(bv), "best_epoch": int(be),
+                "bad_epochs": int(bad), "rank_started_at_epoch": int(rse),
+                "train_idx": ti, "val_idx": vi, "test_idx": tsi,
+                "config": asdict(cfg) | {"data_path": str(cfg.data_path), "output_dir": str(cfg.output_dir)}}, path)
 
-def save_encoder_only(path: Path, model: EEGConformerDualHead) -> None:
+def save_encoder(path, model):
     torch.save({"model": model.state_dict(), "config": CONFORMER_CONFIG}, path)
 
 # ---------------------------------------------------------------------------
-# High-level orchestrator
+# DataLoader
 # ---------------------------------------------------------------------------
 
-def make_loader(
-    ds: EEGWindowArrayDataset,
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int,
-    pin_memory: bool = False,
-    persistent_workers: bool = False,
-) -> DataLoader:
-    """OOM 修复版 DataLoader：默认关闭 pin_memory 和 persistent_workers。"""
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers if num_workers > 0 else False,
-        drop_last=False,
-    )
+def make_loader(ds, bs, shuffle, nw, pin=False, pw=False):
+    return DataLoader(ds, batch_size=bs, shuffle=shuffle, num_workers=nw,
+                      pin_memory=pin, persistent_workers=pw if nw > 0 else False, drop_last=False)
 
-def _parse_subjects(s: str) -> List[str]:
-    return [p.strip() for p in s.split(",") if p.strip()]
-
-def _log_memory(logger: logging.Logger, label: str = "") -> None:
-    """Log current process RSS (if psutil available)."""
-    try:
-        import psutil
-        rss_gb = psutil.Process().memory_info().rss / 1024**3
-        logger.info(f"[MEM{' '+label if label else ''}] RSS = {rss_gb:.2f} GB")
-    except ImportError:
-        pass
+# ---------------------------------------------------------------------------
+# ======== MAIN TRAINING ORCHESTRATOR ========
+# ---------------------------------------------------------------------------
 
 def run_training(cfg: TrainConfig) -> Dict[str, object]:
-    cfg.output_dir = Path(cfg.output_dir)
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    set_seed(cfg.seed)
-    logger = setup_logger(cfg.output_dir)
-    device = resolve_device(cfg.device)
-    use_amp = bool(cfg.amp and device.type == "cuda")
+    cfg.output_dir = Path(cfg.output_dir); cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    set_seed(cfg.seed); logger = setup_logger(cfg.output_dir)
+    device = resolve_device(cfg.device); use_amp = bool(cfg.amp and device.type == "cuda")
 
-    # ---- data ----
-    from .dataset import load_dataset_npz
-    x, y, s, meta, splits = load_dataset_npz(cfg.data_path)
-    n_total = len(y)
-    logger.info(f"Loaded data: X={x.shape} ({x.nbytes/1024**3:.2f} GB), y={y.shape}, s={s.shape}")
-    _log_memory(logger, "after-load")
+    # ================================================================
+    # STEP 1: mmap 加载 —— X 零 RAM，只加载 y/s/meta（很小）
+    # ================================================================
+    _log_mem(logger, "before-load")
 
-    # ---- subject-level filtering ----
+    # 先只加载 meta 来确定需要哪些 indices
+    x_full, y_full, s_full, meta, splits_or_map = load_dataset_mmap(cfg.data_path)
+    n_total = len(y_full)
+    x_shape = x_full.shape
+    logger.info(f"Data: X shape={x_shape} (mmap, 0 RAM), N={n_total}")
+    _log_mem(logger, "after-mmap-load")
+
+    # ================================================================
+    # STEP 2: 确定需要的 indices
+    # ================================================================
     train_subj = _parse_subjects(cfg.train_subjects)
     val_subj   = _parse_subjects(cfg.val_subjects)
     test_subj  = _parse_subjects(cfg.test_subjects)
-    use_subject_filter = bool(train_subj or val_subj or test_subj)
+    use_subj_filter = bool(train_subj or val_subj or test_subj)
 
-    if use_subject_filter:
-        logger.info(f"[SUBJECT-FILTER] train={train_subj or 'ALL'}, "
-                     f"val={val_subj or 'REST'}, test={test_subj or 'REST'}")
-        all_subjects_in_data = sorted(set(str(m.get("subject", "")) for m in meta))
-        logger.info(f"[SUBJECT-FILTER] subjects in data: {all_subjects_in_data}")
+    if use_subj_filter:
+        logger.info(f"[SUBJECT-FILTER] train={train_subj or 'ALL'}, val={val_subj or 'REST'}, test={test_subj or 'REST'}")
+        all_subj = sorted(set(str(m.get("subject", "")) for m in meta))
+        logger.info(f"[SUBJECT-FILTER] subjects in data: {all_subj}")
 
         if train_subj:
             train_idx = filter_by_subjects(meta, train_subj)
         else:
-            excluded = set(val_subj) | set(test_subj)
-            remaining = [sv for sv in all_subjects_in_data if sv not in excluded]
-            train_idx = filter_by_subjects(meta, remaining) if remaining else np.arange(n_total, dtype=np.int64)
+            excl = set(val_subj) | set(test_subj)
+            train_idx = filter_by_subjects(meta, [s for s in all_subj if s not in excl]) if val_subj or test_subj else np.arange(n_total, dtype=np.int64)
 
         if val_subj:
             val_idx = filter_by_subjects(meta, val_subj)
         else:
             rng = np.random.default_rng(cfg.seed)
-            pool = np.setdiff1d(np.arange(n_total), np.concatenate([train_idx, filter_by_subjects(meta, test_subj)] if test_subj else [train_idx]))
-            if len(pool) == 0:
-                pool = np.setdiff1d(np.arange(n_total), train_idx)
+            pool = np.setdiff1d(np.arange(n_total), train_idx)
             n_val = max(1, int(round(len(pool) * 0.1)))
-            val_idx = rng.choice(pool, size=min(n_val, len(pool)), replace=False)
-            val_idx.sort()
+            val_idx = np.sort(rng.choice(pool, size=min(n_val, len(pool)), replace=False))
 
         if test_subj:
             test_idx = filter_by_subjects(meta, test_subj)
@@ -377,231 +254,170 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             if len(pool) > 0:
                 rng = np.random.default_rng(cfg.seed + 1)
                 n_test = max(1, int(round(len(pool) * 0.5)))
-                test_idx = rng.choice(pool, size=min(n_test, len(pool)), replace=False)
-                test_idx.sort()
+                test_idx = np.sort(rng.choice(pool, size=min(n_test, len(pool)), replace=False))
             else:
                 test_idx = np.array([], dtype=np.int64)
-
         logger.info(f"[SUBJECT-FILTER] sizes: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
     else:
-        if {"train", "val", "test"} <= set(splits.keys()):
-            train_idx = splits["train"]
-            val_idx = splits["val"]
-            test_idx = splits["test"]
+        if {"train", "val", "test"} <= set(splits_or_map.keys()):
+            train_idx, val_idx, test_idx = splits_or_map["train"], splits_or_map["val"], splits_or_map["test"]
         else:
             rng = np.random.default_rng(cfg.seed)
-            idx = np.arange(n_total)
-            rng.shuffle(idx)
-            n_test = int(round(n_total * 0.1))
-            n_val = int(round(n_total * 0.1))
-            test_idx = idx[:n_test]
-            val_idx = idx[n_test:n_test + n_val]
-            train_idx = idx[n_test + n_val:]
-            logger.warning("No baked-in splits; random window-level split fallback.")
+            idx = np.arange(n_total); rng.shuffle(idx)
+            n_test = int(round(n_total * 0.1)); n_val = int(round(n_total * 0.1))
+            test_idx = idx[:n_test]; val_idx = idx[n_test:n_test + n_val]; train_idx = idx[n_test + n_val:]
+            logger.warning("No baked-in splits; random fallback.")
 
-    logger.info(f"Split sizes: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+    if len(val_idx) == 0: logger.error("Empty val set."); return {"error": "empty val"}
+    if len(train_idx) == 0: logger.error("Empty train set."); return {"error": "empty train"}
 
-    if len(val_idx) == 0:
-        logger.error("Validation set is EMPTY. Aborting.")
-        return {"error": "empty val set"}
-    if len(train_idx) == 0:
-        logger.error("Training set is EMPTY. Aborting.")
-        return {"error": "empty train set"}
+    # ================================================================
+    # STEP 3: 只把需要的行从 mmap 拷贝进 RAM
+    # 单被试训练: ~600MB，全量训练: ~12GB（如果全量也 OOM 则需减少被试）
+    # ================================================================
+    all_needed = np.sort(np.unique(np.concatenate([train_idx, val_idx, test_idx])))
+    subset_gb = len(all_needed) * x_shape[1] * x_shape[2] * 4 / 1024**3
+    logger.info(f"Copying {len(all_needed)}/{n_total} rows into RAM (~{subset_gb:.2f} GB)...")
 
-    # =====================================================
-    # OOM 修复：用 indices 模式创建 Dataset（零拷贝）
-    # 所有 dataset 共享同一份 x/y/s 底层数组，内存 ~1X
-    # 旧代码 x[train_idx] 会复制 ~80% 数据，导致 ~2X 内存
-    # =====================================================
-    train_ds = EEGWindowArrayDataset(x, y, s, indices=train_idx)
-    val_ds = EEGWindowArrayDataset(x, y, s, indices=val_idx)
-    test_ds = EEGWindowArrayDataset(x, y, s, indices=test_idx) if len(test_idx) > 0 else None
+    x_sub = np.array(x_full[all_needed], dtype=np.float32)   # 从 mmap 读取，写进 RAM
+    y_sub = np.array(y_full[all_needed])
+    s_sub = np.array(s_full[all_needed])
+    meta_sub = [meta[i] for i in all_needed]
 
-    # OOM 修复：创建 DataLoader（关闭 pin_memory / persistent_workers）
-    train_loader = make_loader(train_ds, cfg.batch_size, True, cfg.num_workers,
-                               pin_memory=cfg.pin_memory,
-                               persistent_workers=cfg.persistent_workers)
-    val_loader = make_loader(val_ds, cfg.batch_size, False, cfg.num_workers,
-                             pin_memory=cfg.pin_memory,
-                             persistent_workers=cfg.persistent_workers)
-    test_loader = make_loader(test_ds, cfg.batch_size, False, cfg.num_workers,
-                              pin_memory=cfg.pin_memory,
-                              persistent_workers=cfg.persistent_workers
-                              ) if test_ds is not None else None
-
-    # OOM 修复：积极释放 numpy 数组 + meta 列表
-    # torch.from_numpy 创建的是零拷贝视图，torch tensor 持有底层内存
-    # 删除 numpy 引用后，内存由 torch tensor 管理
-    del meta, splits
+    # 释放 mmap + 全量小数组
+    del x_full, y_full, s_full, meta, splits_or_map
     gc.collect()
-    _log_memory(logger, "after-dataset-create")
+    _log_mem(logger, "after-subset-copy")
 
-    # ---- model ----
+    # 重映射 indices: 全局 → 子集内 0-based
+    idx_map = {int(old): new for new, old in enumerate(all_needed)}
+    train_idx_local = np.array([idx_map[int(i)] for i in train_idx], dtype=np.int64)
+    val_idx_local   = np.array([idx_map[int(i)] for i in val_idx], dtype=np.int64)
+    test_idx_local  = np.array([idx_map[int(i)] for i in test_idx], dtype=np.int64) if len(test_idx) > 0 else np.array([], dtype=np.int64)
+    del idx_map, all_needed
+
+    logger.info(f"Split (local): train={len(train_idx_local)}, val={len(val_idx_local)}, test={len(test_idx_local)}")
+
+    # ================================================================
+    # STEP 4: 创建 Dataset 和 DataLoader
+    # ================================================================
+    train_ds = EEGWindowArrayDataset(x_sub, y_sub, s_sub, indices=train_idx_local)
+    val_ds   = EEGWindowArrayDataset(x_sub, y_sub, s_sub, indices=val_idx_local)
+    test_ds  = EEGWindowArrayDataset(x_sub, y_sub, s_sub, indices=test_idx_local) if len(test_idx_local) > 0 else None
+
+    nw = min(cfg.num_workers, 2)  # 硬限制：最多 2 workers
+    train_loader = make_loader(train_ds, cfg.batch_size, True, nw)
+    val_loader   = make_loader(val_ds, cfg.batch_size, False, nw)
+    test_loader  = make_loader(test_ds, cfg.batch_size, False, nw) if test_ds else None
+
+    del x_sub, y_sub, s_sub  # Dataset 已持有 tensor，释放 numpy 引用
+    gc.collect()
+    _log_mem(logger, "after-dataset")
+
+    # ================================================================
+    # STEP 5: 模型
+    # ================================================================
     model = EEGConformerDualHead().to(device)
-
     if cfg.freeze_intensity_head:
-        n_frozen = freeze_intensity_head(model)
-        n_params = count_parameters(model)
-        logger.info(f"[FREEZE-INTENSITY] Frozen {n_frozen:,} params. "
-                     f"Trainable: {n_params:,} ({n_params/1e6:.3f}M)")
+        nf = freeze_intensity_head(model); n_params = count_parameters(model)
+        logger.info(f"[FREEZE] {nf:,} frozen, {n_params:,} trainable ({n_params/1e6:.3f}M)")
     else:
         n_params = count_parameters(model)
-        logger.info(f"EEGConformerDualHead params={n_params/1e6:.3f}M")
+        logger.info(f"Model params={n_params/1e6:.3f}M")
 
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg.lr,
-        betas=(cfg.beta1, cfg.beta2),
-        weight_decay=cfg.weight_decay,
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr,
+                                betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    # ---- checkpoint paths ----
+    # ---- paths ----
     state_path = Path(cfg.resume_path) if cfg.resume_path else (cfg.output_dir / "train_state.pt")
     best_model_path = cfg.output_dir / "best_model.pt"
     best_encoder_path = cfg.output_dir / "best_encoder.pt"
-    last_model_path = cfg.output_dir / "last_model.pt"
     summary_path = cfg.output_dir / "summary.json"
-    config_dump_path = cfg.output_dir / "train_config.json"
-
-    with open(config_dump_path, "w", encoding="utf-8") as fh:
-        json.dump(asdict(cfg) | {"data_path": str(cfg.data_path), "output_dir": str(cfg.output_dir)},
-                  fh, indent=2, ensure_ascii=False)
+    with open(cfg.output_dir / "train_config.json", "w", encoding="utf-8") as f:
+        json.dump(asdict(cfg) | {"data_path": str(cfg.data_path), "output_dir": str(cfg.output_dir)}, f, indent=2, ensure_ascii=False)
 
     # ---- resume ----
     best_val_acc, best_epoch, bad_epochs = -1.0, -1, 0
-    start_epoch = 1
-    rank_started_at_epoch = cfg.pretrain_epochs + 1
+    start_epoch = 1; rse = cfg.pretrain_epochs + 1
     if cfg.resume and state_path.exists():
         rs = torch.load(state_path, map_location="cpu")
-        model.load_state_dict(rs["model"])
-        optimizer.load_state_dict(rs["optimizer"])
+        model.load_state_dict(rs["model"]); optimizer.load_state_dict(rs["optimizer"])
         optimizer_to(optimizer, device)
         if "scaler" in rs and use_amp:
-            try:
-                scaler.load_state_dict(rs["scaler"])
-            except Exception:
-                pass
-        best_val_acc = float(rs.get("best_val_acc", -1.0))
-        best_epoch = int(rs.get("best_epoch", -1))
-        bad_epochs = int(rs.get("bad_epochs", 0))
-        rank_started_at_epoch = int(rs.get("rank_started_at_epoch", rank_started_at_epoch))
-        start_epoch = int(rs.get("epoch", 0)) + 1
-        del rs
-        gc.collect()
-        logger.info(f"[RESUME] from epoch {start_epoch} (best={best_val_acc:.4f} @ ep {best_epoch})")
+            try: scaler.load_state_dict(rs["scaler"])
+            except Exception: pass
+        best_val_acc = float(rs.get("best_val_acc", -1.0)); best_epoch = int(rs.get("best_epoch", -1))
+        bad_epochs = int(rs.get("bad_epochs", 0)); rse = int(rs.get("rank_started_at_epoch", rse))
+        start_epoch = int(rs.get("epoch", 0)) + 1; del rs; gc.collect()
+        logger.info(f"[RESUME] ep {start_epoch} (best={best_val_acc:.4f} @{best_epoch})")
 
-    # ---- runtime budget ----
     t0 = time.time()
-    deadline_ts: Optional[float] = None
-    if cfg.max_runtime_hours and cfg.max_runtime_hours > 0:
-        deadline_ts = t0 + cfg.max_runtime_hours * 3600.0
-        logger.info(f"Max runtime: {cfg.max_runtime_hours:.2f}h")
+    deadline_ts = t0 + cfg.max_runtime_hours * 3600.0 if cfg.max_runtime_hours > 0 else None
 
-    # ---- training loop ----
+    # ================================================================
+    # STEP 6: 训练循环
+    # ================================================================
     last_epoch = start_epoch - 1
     for epoch in range(start_epoch, cfg.max_epochs + 1):
         last_epoch = epoch
-        is_pretrain = epoch <= cfg.pretrain_epochs
-
-        if is_pretrain:
-            criterion = WeightedDualLoss(LossConfig(
-                alpha=1.0, beta=0.0, gamma=0.0,
-                label_smoothing=cfg.label_smoothing,
-                enable_rank=False,
-                sample_weight_mode=cfg.sample_weight_mode,
-                intensity_threshold=cfg.intensity_threshold,
-                weak_sample_weight=cfg.weak_sample_weight,
-            ))
+        is_pre = epoch <= cfg.pretrain_epochs
+        if is_pre:
+            criterion = WeightedDualLoss(LossConfig(alpha=1.0, beta=0.0, gamma=0.0,
+                label_smoothing=cfg.label_smoothing, enable_rank=False,
+                sample_weight_mode=cfg.sample_weight_mode, intensity_threshold=cfg.intensity_threshold,
+                weak_sample_weight=cfg.weak_sample_weight))
         else:
-            gamma = gamma_schedule(epoch, cfg, rank_started_at_epoch)
+            gamma = gamma_schedule(epoch, cfg, rse)
             if cfg.freeze_intensity_head:
-                criterion = WeightedDualLoss(LossConfig(
-                    alpha=cfg.alpha_cls, beta=0.0, gamma=gamma,
-                    label_smoothing=cfg.label_smoothing,
-                    enable_rank=cfg.enable_rank and gamma > 0,
-                    rank_margin=cfg.rank_margin,
-                    sample_weight_mode=cfg.sample_weight_mode,
-                    intensity_threshold=cfg.intensity_threshold,
-                    weak_sample_weight=cfg.weak_sample_weight,
-                ))
+                criterion = WeightedDualLoss(LossConfig(alpha=cfg.alpha_cls, beta=0.0, gamma=gamma,
+                    label_smoothing=cfg.label_smoothing, enable_rank=cfg.enable_rank and gamma > 0,
+                    rank_margin=cfg.rank_margin, sample_weight_mode=cfg.sample_weight_mode,
+                    intensity_threshold=cfg.intensity_threshold, weak_sample_weight=cfg.weak_sample_weight))
             else:
-                criterion = build_loss(cfg, gamma=gamma, enable_rank=cfg.enable_rank and gamma > 0)
+                criterion = build_loss(cfg, gamma, cfg.enable_rank and gamma > 0)
 
         lr_now = cosine_lr(epoch - 1, cfg.max_epochs, cfg.lr, cfg.min_lr)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr_now
+        for pg in optimizer.param_groups: pg["lr"] = lr_now
 
-        tr, deadline_hit = train_one_epoch(
-            model, train_loader, criterion, optimizer, scaler,
-            device, use_amp, cfg.grad_clip, deadline_ts,
-        )
+        tr, dh = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, use_amp, cfg.grad_clip, deadline_ts)
         va = evaluate(model, val_loader, criterion, device, use_amp)
-        phase = "PRE" if is_pretrain else "JOINT"
-        if cfg.freeze_intensity_head and not is_pretrain:
-            phase = "CLS-ONLY"
-        logger.info(
-            f"[E{epoch:03d}|{phase}] lr={lr_now:.2e} "
-            f"train: loss={tr['loss']:.4f} acc={tr['acc']:.4f} cls={tr['cls']:.4f} reg={tr['reg']:.4f} rank={tr['rank']:.4f} | "
-            f"val: loss={va['loss']:.4f} acc={va['acc']:.4f} mae={va['intensity_mae']:.4f}"
-        )
+        phase = "PRE" if is_pre else ("CLS" if cfg.freeze_intensity_head else "JOINT")
+        logger.info(f"[E{epoch:03d}|{phase}] lr={lr_now:.2e} "
+                     f"tr loss={tr['loss']:.4f} acc={tr['acc']:.4f} | "
+                     f"va loss={va['loss']:.4f} acc={va['acc']:.4f} mae={va['intensity_mae']:.4f}")
 
-        improved = va["acc"] > best_val_acc
-        if improved:
+        if va["acc"] > best_val_acc:
             best_val_acc, best_epoch, bad_epochs = va["acc"], epoch, 0
             torch.save({"model": model.state_dict(), "config": CONFORMER_CONFIG, "val": va}, best_model_path)
-            save_encoder_only(best_encoder_path, model)
+            save_encoder(best_encoder_path, model)
         else:
             bad_epochs += 1
 
-        if epoch % cfg.save_interval == 0 or improved or deadline_hit:
-            save_train_state(
-                state_path, epoch, model, optimizer, scaler,
-                best_val_acc, best_epoch, bad_epochs,
-                rank_started_at_epoch,
-                train_idx, val_idx, test_idx, cfg,
-            )
-
-        if deadline_hit:
-            logger.warning(f"[TIMEUP] reached {cfg.max_runtime_hours:.2f}h at epoch {epoch}; saved.")
-            break
-
+        if epoch % cfg.save_interval == 0 or va["acc"] >= best_val_acc or dh:
+            save_state(state_path, epoch, model, optimizer, scaler, best_val_acc, best_epoch, bad_epochs, rse,
+                       train_idx, val_idx, test_idx, cfg)
+        if dh: logger.warning(f"[TIMEUP] @{epoch}"); break
         if bad_epochs >= cfg.patience:
-            logger.info(f"[EARLY-STOP] no improvement for {cfg.patience} epochs. best={best_val_acc:.4f} @ ep {best_epoch}")
-            break
+            logger.info(f"[EARLY-STOP] @{epoch}, best={best_val_acc:.4f} @{best_epoch}"); break
 
-    # ---- final save ----
     if cfg.save_last:
-        torch.save({"model": model.state_dict(), "config": CONFORMER_CONFIG, "epoch": last_epoch}, last_model_path)
+        torch.save({"model": model.state_dict(), "config": CONFORMER_CONFIG, "epoch": last_epoch},
+                    cfg.output_dir / "last_model.pt")
 
-    # ---- test eval ----
     test_metrics = {}
-    if best_model_path.exists() and test_loader is not None:
-        ck = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(ck["model"])
-        del ck
-        gc.collect()
-        final_criterion = build_loss(cfg, gamma=0.0, enable_rank=False)
-        test_metrics = evaluate(model, test_loader, final_criterion, device, use_amp)
+    if best_model_path.exists() and test_loader:
+        ck = torch.load(best_model_path, map_location=device); model.load_state_dict(ck["model"]); del ck; gc.collect()
+        test_metrics = evaluate(model, test_loader, build_loss(cfg, 0.0, False), device, use_amp)
         logger.info(f"[TEST] acc={test_metrics['acc']:.4f} mae={test_metrics['intensity_mae']:.4f}")
-    elif best_model_path.exists() and test_loader is None:
-        logger.info("[TEST] No test set; skipping.")
-    else:
-        logger.warning("No best model; skipping test.")
 
-    summary = {
-        "best_val_acc": best_val_acc,
-        "best_epoch": best_epoch,
-        "test": test_metrics,
-        "n_params": int(n_params),
-        "epochs_run": int(last_epoch),
-        "elapsed_seconds": float(time.time() - t0),
-        "freeze_intensity_head": cfg.freeze_intensity_head,
-        "train_subjects": cfg.train_subjects,
-        "val_subjects": cfg.val_subjects,
-        "test_subjects": cfg.test_subjects,
-    }
-    with open(summary_path, "w", encoding="utf-8") as fh:
-        json.dump(summary, fh, indent=2, ensure_ascii=False)
+    summary = {"best_val_acc": best_val_acc, "best_epoch": best_epoch, "test": test_metrics,
+               "n_params": int(n_params), "epochs_run": int(last_epoch),
+               "elapsed_seconds": float(time.time() - t0),
+               "freeze_intensity_head": cfg.freeze_intensity_head,
+               "train_subjects": cfg.train_subjects, "val_subjects": cfg.val_subjects,
+               "test_subjects": cfg.test_subjects}
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
     logger.info(f"Summary -> {summary_path}")
     return summary
