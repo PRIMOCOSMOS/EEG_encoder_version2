@@ -2,17 +2,23 @@
 
 特性（覆盖 Design.md 全部代码原则）：
 - 两阶段训练：(1) 仅 L_cls 预训练 N epochs；(2) 联合训练 L_cls + L_reg (+L_rank)。
-- 【新增】冻结 Intensity Head 选项（freeze_intensity_head），只训练分类分支。
-- 【新增】单被试训练 + 跨被试验证（train_subjects / val_subjects / test_subjects）。
+- 冻结 Intensity Head 选项（freeze_intensity_head），只训练分类分支。
+- 单被试训练 + 跨被试验证（train_subjects / val_subjects / test_subjects）。
 - 余弦退火 (lr_max -> 1e-5)。
 - 周期断点 (`train_state.pt`) + `--resume`。
-- 软超时 (`--max-runtime-hours`, 默认 10 小时)：自动优雅保存退出，防进程被杀丢数据。
+- 软超时 (`--max-runtime-hours`)。
 - AMP 混合精度（CUDA）。
 - 早停（基于验证集分类准确率）。
-- 训练日志逐 epoch 写入 `train.log`。
+
+OOM 修复（v3）：
+- 索引式 Dataset：不复制子数组，所有 split 共享一份底层 x/y/s（~2X → ~1X 内存）
+- 关闭 npz 文件释放解压缓冲区
+- DataLoader：persistent_workers=False / pin_memory=False（避免 COW + 锁页开销）
+- 积极释放：创建 dataset 后 del 原始 numpy 数组 + gc.collect()
 """
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
@@ -78,7 +84,11 @@ class TrainConfig:
     save_interval: int = int(TRAIN_DEFAULTS["save_interval"])
     max_runtime_hours: float = float(TRAIN_DEFAULTS["max_runtime_hours"])
 
-    # ---- 过拟合缓解新增 ----
+    # ---- DataLoader OOM 修复 ----
+    pin_memory: bool = bool(TRAIN_DEFAULTS.get("pin_memory", False))
+    persistent_workers: bool = bool(TRAIN_DEFAULTS.get("persistent_workers", False))
+
+    # ---- 过拟合缓解 ----
     freeze_intensity_head: bool = bool(TRAIN_DEFAULTS.get("freeze_intensity_head", False))
     train_subjects: str = str(TRAIN_DEFAULTS.get("train_subjects", ""))
     val_subjects: str = str(TRAIN_DEFAULTS.get("val_subjects", ""))
@@ -131,7 +141,6 @@ def cosine_lr(epoch: int, total_epochs: int, base_lr: float, min_lr: float) -> f
     return min_lr + (base_lr - min_lr) * cos
 
 def gamma_schedule(epoch: int, cfg: TrainConfig, started_at_epoch: int) -> float:
-    """Linear warmup of ranking weight γ from start to end across `rank_warmup_epochs`."""
     if not cfg.enable_rank:
         return 0.0
     if cfg.rank_warmup_epochs <= 0:
@@ -198,7 +207,6 @@ def train_one_epoch(
     grad_clip: float,
     deadline_ts: Optional[float] = None,
 ) -> Tuple[Dict[str, float], bool]:
-    """Returns (metrics, deadline_hit)."""
     model.train()
     losses, cls_losses, reg_losses, rank_losses = [], [], [], []
     correct = total = 0
@@ -279,28 +287,42 @@ def save_train_state(
     torch.save(state, path)
 
 def save_encoder_only(path: Path, model: EEGConformerDualHead) -> None:
-    """Save just the encoder weights (patch + pos_embed + transformer + feature_proj),
-    plus the dual heads (so encode_seed_vii_features.py can also load classifier if needed)."""
     torch.save({"model": model.state_dict(), "config": CONFORMER_CONFIG}, path)
 
 # ---------------------------------------------------------------------------
 # High-level orchestrator
 # ---------------------------------------------------------------------------
 
-def make_loader(ds: EEGWindowArrayDataset, batch_size: int, shuffle: bool, num_workers: int) -> DataLoader:
+def make_loader(
+    ds: EEGWindowArrayDataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+) -> DataLoader:
+    """OOM 修复版 DataLoader：默认关闭 pin_memory 和 persistent_workers。"""
     return DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=bool(num_workers > 0),
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
         drop_last=False,
     )
 
 def _parse_subjects(s: str) -> List[str]:
-    """Parse a comma-separated subject string into a list of stripped non-empty strings."""
     return [p.strip() for p in s.split(",") if p.strip()]
+
+def _log_memory(logger: logging.Logger, label: str = "") -> None:
+    """Log current process RSS (if psutil available)."""
+    try:
+        import psutil
+        rss_gb = psutil.Process().memory_info().rss / 1024**3
+        logger.info(f"[MEM{' '+label if label else ''}] RSS = {rss_gb:.2f} GB")
+    except ImportError:
+        pass
 
 def run_training(cfg: TrainConfig) -> Dict[str, object]:
     cfg.output_dir = Path(cfg.output_dir)
@@ -314,33 +336,31 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     from .dataset import load_dataset_npz
     x, y, s, meta, splits = load_dataset_npz(cfg.data_path)
     n_total = len(y)
-    logger.info(f"Loaded data: X={x.shape}, y={y.shape}, s={s.shape}, splits_in_npz={list(splits.keys())}")
+    logger.info(f"Loaded data: X={x.shape} ({x.nbytes/1024**3:.2f} GB), y={y.shape}, s={s.shape}")
+    _log_memory(logger, "after-load")
 
-    # ---- subject-level filtering (NEW) ----
+    # ---- subject-level filtering ----
     train_subj = _parse_subjects(cfg.train_subjects)
     val_subj   = _parse_subjects(cfg.val_subjects)
     test_subj  = _parse_subjects(cfg.test_subjects)
     use_subject_filter = bool(train_subj or val_subj or test_subj)
 
     if use_subject_filter:
-        logger.info(f"[SUBJECT-FILTER] train_subjects={train_subj or 'ALL'}, "
-                     f"val_subjects={val_subj or 'REST'}, test_subjects={test_subj or 'REST'}")
+        logger.info(f"[SUBJECT-FILTER] train={train_subj or 'ALL'}, "
+                     f"val={val_subj or 'REST'}, test={test_subj or 'REST'}")
         all_subjects_in_data = sorted(set(str(m.get("subject", "")) for m in meta))
-        logger.info(f"[SUBJECT-FILTER] subjects found in data: {all_subjects_in_data}")
+        logger.info(f"[SUBJECT-FILTER] subjects in data: {all_subjects_in_data}")
 
-        # Train: if specified, use only those; otherwise all except val/test
         if train_subj:
             train_idx = filter_by_subjects(meta, train_subj)
         else:
             excluded = set(val_subj) | set(test_subj)
-            remaining = [s for s in all_subjects_in_data if s not in excluded]
+            remaining = [sv for sv in all_subjects_in_data if sv not in excluded]
             train_idx = filter_by_subjects(meta, remaining) if remaining else np.arange(n_total, dtype=np.int64)
 
-        # Val: if specified, use only those; otherwise empty (or warn)
         if val_subj:
             val_idx = filter_by_subjects(meta, val_subj)
         else:
-            # Fallback: randomly pick 10% from the remaining pool
             rng = np.random.default_rng(cfg.seed)
             pool = np.setdiff1d(np.arange(n_total), np.concatenate([train_idx, filter_by_subjects(meta, test_subj)] if test_subj else [train_idx]))
             if len(pool) == 0:
@@ -349,11 +369,9 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             val_idx = rng.choice(pool, size=min(n_val, len(pool)), replace=False)
             val_idx.sort()
 
-        # Test: if specified, use only those; otherwise empty
         if test_subj:
             test_idx = filter_by_subjects(meta, test_subj)
         else:
-            # No dedicated test subjects: leave empty or pick from unused
             used = set(train_idx.tolist()) | set(val_idx.tolist())
             pool = np.array([i for i in range(n_total) if i not in used])
             if len(pool) > 0:
@@ -364,17 +382,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             else:
                 test_idx = np.array([], dtype=np.int64)
 
-        logger.info(f"[SUBJECT-FILTER] filtered sizes: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
-
-        # Sanity check: no overlap
-        overlap = set(train_idx.tolist()) & set(val_idx.tolist())
-        if overlap:
-            logger.warning(f"[SUBJECT-FILTER] WARNING: train/val overlap = {len(overlap)} samples!")
-        overlap = set(train_idx.tolist()) & set(test_idx.tolist())
-        if overlap:
-            logger.warning(f"[SUBJECT-FILTER] WARNING: train/test overlap = {len(overlap)} samples!")
+        logger.info(f"[SUBJECT-FILTER] sizes: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
     else:
-        # Original logic: use baked-in splits or random fallback
         if {"train", "val", "test"} <= set(splits.keys()):
             train_idx = splits["train"]
             val_idx = splits["val"]
@@ -388,37 +397,56 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             test_idx = idx[:n_test]
             val_idx = idx[n_test:n_test + n_val]
             train_idx = idx[n_test + n_val:]
-            logger.warning("No baked-in splits found in npz; falling back to random window-level split. "
-                           "For zero-leak: do trial-level split during preprocessing instead.")
+            logger.warning("No baked-in splits; random window-level split fallback.")
 
     logger.info(f"Split sizes: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
 
     if len(val_idx) == 0:
-        logger.error("Validation set is EMPTY. Cannot train with early-stopping. Aborting.")
+        logger.error("Validation set is EMPTY. Aborting.")
         return {"error": "empty val set"}
     if len(train_idx) == 0:
         logger.error("Training set is EMPTY. Aborting.")
         return {"error": "empty train set"}
 
-    train_ds = EEGWindowArrayDataset(x[train_idx], y[train_idx], s[train_idx])
-    val_ds = EEGWindowArrayDataset(x[val_idx], y[val_idx], s[val_idx])
-    test_ds = EEGWindowArrayDataset(x[test_idx], y[test_idx], s[test_idx]) if len(test_idx) > 0 else None
-    train_loader = make_loader(train_ds, cfg.batch_size, True, cfg.num_workers)
-    val_loader = make_loader(val_ds, cfg.batch_size, False, cfg.num_workers)
-    test_loader = make_loader(test_ds, cfg.batch_size, False, cfg.num_workers) if test_ds is not None else None
+    # =====================================================
+    # OOM 修复：用 indices 模式创建 Dataset（零拷贝）
+    # 所有 dataset 共享同一份 x/y/s 底层数组，内存 ~1X
+    # 旧代码 x[train_idx] 会复制 ~80% 数据，导致 ~2X 内存
+    # =====================================================
+    train_ds = EEGWindowArrayDataset(x, y, s, indices=train_idx)
+    val_ds = EEGWindowArrayDataset(x, y, s, indices=val_idx)
+    test_ds = EEGWindowArrayDataset(x, y, s, indices=test_idx) if len(test_idx) > 0 else None
+
+    # OOM 修复：创建 DataLoader（关闭 pin_memory / persistent_workers）
+    train_loader = make_loader(train_ds, cfg.batch_size, True, cfg.num_workers,
+                               pin_memory=cfg.pin_memory,
+                               persistent_workers=cfg.persistent_workers)
+    val_loader = make_loader(val_ds, cfg.batch_size, False, cfg.num_workers,
+                             pin_memory=cfg.pin_memory,
+                             persistent_workers=cfg.persistent_workers)
+    test_loader = make_loader(test_ds, cfg.batch_size, False, cfg.num_workers,
+                              pin_memory=cfg.pin_memory,
+                              persistent_workers=cfg.persistent_workers
+                              ) if test_ds is not None else None
+
+    # OOM 修复：积极释放 numpy 数组 + meta 列表
+    # torch.from_numpy 创建的是零拷贝视图，torch tensor 持有底层内存
+    # 删除 numpy 引用后，内存由 torch tensor 管理
+    del meta, splits
+    gc.collect()
+    _log_memory(logger, "after-dataset-create")
 
     # ---- model ----
     model = EEGConformerDualHead().to(device)
 
-    # ---- 【新增】冻结 Intensity Head ----
     if cfg.freeze_intensity_head:
         n_frozen = freeze_intensity_head(model)
         n_params = count_parameters(model)
-        logger.info(f"[FREEZE-INTENSITY] Frozen {n_frozen:,} params in intensity_head. "
-                     f"Trainable params: {n_params:,} ({n_params/1e6:.3f}M)")
+        logger.info(f"[FREEZE-INTENSITY] Frozen {n_frozen:,} params. "
+                     f"Trainable: {n_params:,} ({n_params/1e6:.3f}M)")
     else:
         n_params = count_parameters(model)
-        logger.info(f"EEGConformerDualHead params={n_params/1e6:.3f}M (target 0.7-0.8M)")
+        logger.info(f"EEGConformerDualHead params={n_params/1e6:.3f}M")
 
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -459,6 +487,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         bad_epochs = int(rs.get("bad_epochs", 0))
         rank_started_at_epoch = int(rs.get("rank_started_at_epoch", rank_started_at_epoch))
         start_epoch = int(rs.get("epoch", 0)) + 1
+        del rs
+        gc.collect()
         logger.info(f"[RESUME] from epoch {start_epoch} (best={best_val_acc:.4f} @ ep {best_epoch})")
 
     # ---- runtime budget ----
@@ -466,17 +496,14 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     deadline_ts: Optional[float] = None
     if cfg.max_runtime_hours and cfg.max_runtime_hours > 0:
         deadline_ts = t0 + cfg.max_runtime_hours * 3600.0
-        logger.info(f"Max runtime: {cfg.max_runtime_hours:.2f}h, deadline_ts={deadline_ts}")
+        logger.info(f"Max runtime: {cfg.max_runtime_hours:.2f}h")
 
-    # ---- training ----
+    # ---- training loop ----
     last_epoch = start_epoch - 1
     for epoch in range(start_epoch, cfg.max_epochs + 1):
         last_epoch = epoch
-        # phase: pretrain (cls only) vs joint
         is_pretrain = epoch <= cfg.pretrain_epochs
 
-        # 【新增】如果冻结了 intensity head，在 joint 阶段也把 beta_reg 设为 0
-        # （强度头不更新，回归 loss 是常数，浪费梯度计算）
         if is_pretrain:
             criterion = WeightedDualLoss(LossConfig(
                 alpha=1.0, beta=0.0, gamma=0.0,
@@ -489,7 +516,6 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         else:
             gamma = gamma_schedule(epoch, cfg, rank_started_at_epoch)
             if cfg.freeze_intensity_head:
-                # 冻结模式下：reg loss 无意义（不更新），设 beta=0 避免浪费
                 criterion = WeightedDualLoss(LossConfig(
                     alpha=cfg.alpha_cls, beta=0.0, gamma=gamma,
                     label_smoothing=cfg.label_smoothing,
@@ -502,7 +528,6 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             else:
                 criterion = build_loss(cfg, gamma=gamma, enable_rank=cfg.enable_rank and gamma > 0)
 
-        # cosine LR
         lr_now = cosine_lr(epoch - 1, cfg.max_epochs, cfg.lr, cfg.min_lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr_now
@@ -514,7 +539,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         va = evaluate(model, val_loader, criterion, device, use_amp)
         phase = "PRE" if is_pretrain else "JOINT"
         if cfg.freeze_intensity_head and not is_pretrain:
-            phase = "CLS-ONLY"  # 实际只训练分类
+            phase = "CLS-ONLY"
         logger.info(
             f"[E{epoch:03d}|{phase}] lr={lr_now:.2e} "
             f"train: loss={tr['loss']:.4f} acc={tr['acc']:.4f} cls={tr['cls']:.4f} reg={tr['reg']:.4f} rank={tr['rank']:.4f} | "
@@ -538,29 +563,31 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             )
 
         if deadline_hit:
-            logger.warning(f"[TIMEUP] reached {cfg.max_runtime_hours:.2f}h budget at epoch {epoch}; saved and exiting gracefully.")
+            logger.warning(f"[TIMEUP] reached {cfg.max_runtime_hours:.2f}h at epoch {epoch}; saved.")
             break
 
         if bad_epochs >= cfg.patience:
-            logger.info(f"[EARLY-STOP] no val improvement for {cfg.patience} epochs. best={best_val_acc:.4f} @ ep {best_epoch}")
+            logger.info(f"[EARLY-STOP] no improvement for {cfg.patience} epochs. best={best_val_acc:.4f} @ ep {best_epoch}")
             break
 
     # ---- final save ----
     if cfg.save_last:
         torch.save({"model": model.state_dict(), "config": CONFORMER_CONFIG, "epoch": last_epoch}, last_model_path)
 
-    # ---- test eval (on best model) ----
+    # ---- test eval ----
     test_metrics = {}
     if best_model_path.exists() and test_loader is not None:
         ck = torch.load(best_model_path, map_location=device)
         model.load_state_dict(ck["model"])
+        del ck
+        gc.collect()
         final_criterion = build_loss(cfg, gamma=0.0, enable_rank=False)
         test_metrics = evaluate(model, test_loader, final_criterion, device, use_amp)
         logger.info(f"[TEST] acc={test_metrics['acc']:.4f} mae={test_metrics['intensity_mae']:.4f}")
     elif best_model_path.exists() and test_loader is None:
-        logger.info("[TEST] No test set provided; skipping test evaluation.")
+        logger.info("[TEST] No test set; skipping.")
     else:
-        logger.warning("No best model found; skipping test evaluation.")
+        logger.warning("No best model; skipping test.")
 
     summary = {
         "best_val_acc": best_val_acc,

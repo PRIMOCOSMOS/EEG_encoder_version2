@@ -64,7 +64,7 @@ TRAIN_DEFAULTS: Dict[str, object] = {
     "amp": True,
     "seed": 42,
     "batch_size": 256,
-    "num_workers": 6,
+    "num_workers": 2,          # OOM 修复：6 → 2，每个 worker fork 都会 COW 复制页表
 
     # 优化器
     "optimizer": "adam",
@@ -106,6 +106,10 @@ TRAIN_DEFAULTS: Dict[str, object] = {
     "save_last": True,
     "save_features": False,
     "feature_type": "projected",  # ["projected", "flatten"]
+
+    # ---- DataLoader OOM 修复 ----
+    "pin_memory": False,           # OOM 修复：关闭锁页内存，避免额外 RAM 开销
+    "persistent_workers": False,   # OOM 修复：关闭常驻 worker，避免 COW 页表膨胀
 
     # ---- 过拟合缓解：冻结 Intensity Head + 单被试训练 ----
     "freeze_intensity_head": False,  # 冻结强度回归头，只训练分类
