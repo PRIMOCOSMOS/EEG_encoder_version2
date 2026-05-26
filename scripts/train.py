@@ -13,7 +13,6 @@ sys.path.insert(0, str(ROOT))
 from src.config import TRAIN_DEFAULTS  # noqa: E402
 from src.trainer import TrainConfig, run_training  # noqa: E402
 
-
 def parse_args() -> TrainConfig:
     p = argparse.ArgumentParser(description="Train SEED-VII EEG-Conformer (dual-head)")
     p.add_argument("--data", type=str, required=True)
@@ -73,7 +72,36 @@ def parse_args() -> TrainConfig:
         default=str(TRAIN_DEFAULTS["feature_type"]),
     )
 
-    # ----- ModelScope auto-download fallback -----
+    # ---- 过拟合缓解：新增参数 ----
+    p.add_argument(
+        "--freeze-intensity-head",
+        action="store_true",
+        help="Freeze the intensity regression head; only train the classification head. "
+             "Recommended when val loss does not decrease (overfitting on regression).",
+    )
+    p.add_argument(
+        "--train-subjects",
+        type=str,
+        default="",
+        help="Comma-separated subject IDs for training (e.g. '1,2,3'). "
+             "If empty, uses all except val/test subjects.",
+    )
+    p.add_argument(
+        "--val-subjects",
+        type=str,
+        default="",
+        help="Comma-separated subject IDs for validation (e.g. '10,11'). "
+             "These subjects are held out entirely from training.",
+    )
+    p.add_argument(
+        "--test-subjects",
+        type=str,
+        default="",
+        help="Comma-separated subject IDs for testing (e.g. '19,20'). "
+             "These subjects are held out entirely from training and validation.",
+    )
+
+    # ---- ModelScope auto-download fallback -----
     p.add_argument(
         "--ms-data",
         type=str,
@@ -96,7 +124,7 @@ def parse_args() -> TrainConfig:
 
     args = p.parse_args()
 
-    # ----- Auto-download training data from ModelScope if local file missing -----
+    # ---- Auto-download training data from ModelScope if local file missing -----
     data_path = Path(args.data)
     if not data_path.exists():
         if args.ms_data and args.ms_data_path:
@@ -116,8 +144,6 @@ def parse_args() -> TrainConfig:
                 token=args.ms_token or os.environ.get("MODELSCOPE_API_TOKEN"),
             )
             downloaded_path = Path(downloaded)
-            # dataset_file_download saves as local_dir / basename(file_path)
-            # If the resolved path differs from the expected --data path, rename.
             if downloaded_path.resolve() != data_path.resolve():
                 if downloaded_path.exists() and not data_path.exists():
                     downloaded_path.rename(data_path)
@@ -169,13 +195,16 @@ def parse_args() -> TrainConfig:
         max_runtime_hours=args.max_runtime_hours,
         save_features=args.save_features,
         feature_type=args.feature_type,
+        # ---- new ----
+        freeze_intensity_head=bool(args.freeze_intensity_head),
+        train_subjects=args.train_subjects,
+        val_subjects=args.val_subjects,
+        test_subjects=args.test_subjects,
     )
-
 
 def main() -> None:
     cfg = parse_args()
     run_training(cfg)
-
 
 if __name__ == "__main__":
     main()

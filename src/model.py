@@ -3,14 +3,14 @@
 参考 PRIMOCOSMOS/EEG_encoder（SEED-IV 实现）；保持参数量 ≈0.7–0.8M。
 
 架构：
-    Input (B, 1, 62, T=800)
-        -> PatchEmbedding [time conv + spatial depthwise + BN + ELU + avgpool + dropout]
-        -> + positional embedding
-        -> TransformerEncoder × 6 (heads=10, ffn=160)
-        -> Flatten -> Linear(N_tokens * D -> head_hidden)  == projected embedding
-           |\
-           | --> classifier  : Linear(head_hidden -> 7), softmax in loss
-           \\ --> intensity   : Linear(head_hidden -> H) -> ELU -> Linear(H -> 1) -> Sigmoid
+  Input (B, 1, 62, T=800)
+  -> PatchEmbedding [time conv + spatial depthwise + BN + ELU + avgpool + dropout]
+  -> + positional embedding
+  -> TransformerEncoder × 6 (heads=10, ffn=160)
+  -> Flatten -> Linear(N_tokens * D -> head_hidden) == projected embedding
+  |\
+  | --> classifier : Linear(head_hidden -> 7), softmax in loss
+  \ --> intensity : Linear(head_hidden -> H) -> ELU -> Linear(H -> 1) -> Sigmoid
 """
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ import torch
 import torch.nn as nn
 
 from .config import CONFORMER_CONFIG
-
 
 class PatchEmbedding(nn.Module):
     def __init__(self, cfg: dict = CONFORMER_CONFIG):
@@ -42,14 +41,13 @@ class PatchEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, 1, C, T)
-        x = self.time_conv(x)        # (B, D, C, T)
-        x = self.spatial_conv(x)     # (B, D, 1, T)
+        x = self.time_conv(x)       # (B, D, C, T)
+        x = self.spatial_conv(x)    # (B, D, 1, T)
         x = self.bn(x)
         x = self.elu(x)
-        x = self.pool(x)             # (B, D, 1, T')
+        x = self.pool(x)            # (B, D, 1, T')
         x = self.drop(x)
         return x.squeeze(2).transpose(1, 2)  # (B, T', D)
-
 
 class IntensityHead(nn.Module):
     def __init__(self, in_dim: int, hidden: int, dropout: float):
@@ -63,7 +61,6 @@ class IntensityHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.net(x))  # ∈ (0,1)
-
 
 class EEGConformerDualHead(nn.Module):
     """EEG-Conformer with dual outputs."""
@@ -104,7 +101,7 @@ class EEGConformerDualHead(nn.Module):
 
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
-    # ---------- encoders ----------
+    # ----------- encoders ----------
     def encode_tokens(self, x: torch.Tensor) -> torch.Tensor:
         z = self.patch(x)
         if z.shape[1] != self.pos_embed.shape[1]:
@@ -112,7 +109,7 @@ class EEGConformerDualHead(nn.Module):
                 f"Token count mismatch: got {z.shape[1]}, expected {self.pos_embed.shape[1]}"
             )
         z = z + self.pos_embed
-        return self.encoder(z)            # (B, T', D)
+        return self.encoder(z)  # (B, T', D)
 
     def encode(self, x: torch.Tensor, feature_type: str = "projected") -> torch.Tensor:
         feat = self.flatten(self.encode_tokens(x))
@@ -122,14 +119,26 @@ class EEGConformerDualHead(nn.Module):
             return self.feature_act(self.feature_proj(feat))
         raise ValueError(f"Unsupported feature_type: {feature_type}")
 
-    # ---------- heads ----------
+    # ----------- heads ----------
     def forward(self, x: torch.Tensor):
         feat = self.encode(x, feature_type="projected")
         feat_d = self.cls_drop(feat)
         logits = self.classifier(feat_d)
-        intensity = self.intensity_head(feat_d).squeeze(-1)   # (B,)
+        intensity = self.intensity_head(feat_d).squeeze(-1)  # (B,)
         return logits, intensity, feat
-
 
 def count_parameters(m: nn.Module) -> int:
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+
+def freeze_intensity_head(model: nn.Module) -> int:
+    """Freeze all parameters in the intensity head.
+
+    Returns the number of parameters frozen.
+    """
+    frozen = 0
+    for name, param in model.named_parameters():
+        if name.startswith("intensity_head"):
+            param.requires_grad = False
+            frozen += param.numel()
+    return frozen

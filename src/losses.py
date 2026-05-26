@@ -5,7 +5,7 @@ L = s_i · (α · L_cls + β · L_reg) + γ · L_rank
 - L_cls : CrossEntropy with label smoothing
 - L_reg : MSE on continuous intensity (predicted ∈ [0,1])
 - L_rank: margin ranking loss between intensity predictions of randomly paired
-          samples sharing the same class label (gold order from `s`).
+  samples sharing the same class label (gold order from `s`).
 - 样本权重 s_i：直接来自 SEED-VII 连续标签（也可阈值化 / 关闭）。
 
 退化方案：构造 `WeightedDualLoss(enable_rank=False, gamma=0)` 即可只用 cls+reg。
@@ -18,7 +18,6 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 def _sample_weights(
     s: torch.Tensor,
@@ -37,7 +36,6 @@ def _sample_weights(
         return w
     raise ValueError(f"Unknown sample_weight_mode: {mode}")
 
-
 def weighted_cross_entropy(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -53,7 +51,6 @@ def weighted_cross_entropy(
     w = weights.detach()
     return (ce * w).sum() / (w.sum().clamp_min(1e-8))
 
-
 def weighted_mse(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -62,7 +59,6 @@ def weighted_mse(
     mse = (pred - target) ** 2
     w = weights.detach()
     return (mse * w).sum() / (w.sum().clamp_min(1e-8))
-
 
 def margin_ranking_loss_intra_class(
     pred_intensity: torch.Tensor,
@@ -102,7 +98,6 @@ def margin_ranking_loss_intra_class(
         return torch.zeros((), device=device)
     return torch.stack(losses).mean()
 
-
 @dataclass
 class LossConfig:
     alpha: float = 1.0
@@ -111,10 +106,9 @@ class LossConfig:
     label_smoothing: float = 0.05
     rank_margin: float = 0.05
     enable_rank: bool = False
-    sample_weight_mode: str = "continuous"   # ["continuous", "threshold", "none"]
+    sample_weight_mode: str = "continuous"  # ["continuous", "threshold", "none"]
     intensity_threshold: float = 0.5
     weak_sample_weight: float = 0.1
-
 
 class WeightedDualLoss(nn.Module):
     """Combined classification + regression (+optional ranking) loss with per-sample weights."""
@@ -125,10 +119,10 @@ class WeightedDualLoss(nn.Module):
 
     def forward(
         self,
-        logits: torch.Tensor,           # (B, C)
-        intensity_pred: torch.Tensor,   # (B,) in [0,1]
-        target_cls: torch.Tensor,       # (B,)
-        target_intensity: torch.Tensor, # (B,) in [0,1]
+        logits: torch.Tensor,            # (B, C)
+        intensity_pred: torch.Tensor,     # (B,) in [0,1]
+        target_cls: torch.Tensor,         # (B,)
+        target_intensity: torch.Tensor,   # (B,) in [0,1]
     ) -> Tuple[torch.Tensor, dict]:
         w = _sample_weights(
             target_intensity,

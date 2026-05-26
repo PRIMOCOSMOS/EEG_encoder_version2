@@ -33,7 +33,7 @@ train:
   gamma_rank_start: 0.3
   gamma_rank_end: 0.8
   rank_warmup_epochs: 30
-  enable_rank: false          # 退化方案：先不开
+  enable_rank: false  # 退化方案：先不开
   rank_margin: 0.05
   label_smoothing: 0.05
   sample_weight_mode: continuous
@@ -43,3 +43,9 @@ train:
   test_ratio: 0.1
   split_unit: trial
   max_runtime_hours: 10.0
+
+  # ---- 过拟合缓解 ----
+  freeze_intensity_head: false   # 冻结强度回归头，只训练分类
+  train_subjects: ""             # 逗号分隔，如 "1,2,3"（空=全部）
+  val_subjects: ""               # 逗号分隔，如 "10,11"（跨被试验证）
+  test_subjects: ""              # 逗号分隔，如 "19,20"
