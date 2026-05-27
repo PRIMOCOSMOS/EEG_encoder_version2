@@ -1,13 +1,19 @@
-"""SEED-VII dataset utilities — 重构版.
+"""SEED-VII dataset utilities — 重构版 (OOM-safe).
 
-核心变化：
-- 预处理输出为 per-subject .npz 文件 (共 20 个)
-- 训练时可按需加载单/多个被试的 npz
+核心设计：
+- 20 个 per-subject .npz → 训练时 **不全量加载到 RAM**
+- Pass 1 (轻量)：只扫描 y/s/meta（总计 < 50MB），构建全局索引
+- Pass 2 (懒加载)：将每个 npz 的 X 解压为独立 .npy，用 np.memmap 打开
+  → 内存占用 ≈ 0（由 OS 页面缓存按需管理）
 - 支持 trial-level 划分以避免数据泄漏
-- 支持从本地 .mat 目录或 ModelScope 远端读取原始数据
 """
 from __future__ import annotations
+
+import gc
 import json
+import os
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -20,35 +26,22 @@ from .labels import EMOTION_TO_IDX, trial_field_to_session_trial, trial_id_to_em
 
 
 # --------------------------------------------------------------------------
-# 数据加载 (per-subject npz)
+# 轻量扫描：只读 y / s / meta，不动 X
 # --------------------------------------------------------------------------
 
-def load_subject_npz(npz_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
-    """Load a single subject's preprocessed npz.
-
-    Returns (X, y, s, meta) where:
-      X: (N, 62, 800) float32
-      y: (N,) int64
-      s: (N,) float32
-      meta: list of dicts
-    """
-    data = np.load(npz_path, allow_pickle=True)
-    X = data["X"]
-    y = data["y"]
-    s = data["s"]
-    meta = [json.loads(m) for m in data["meta"]]
-    return X, y, s, meta
-
-
-def load_multi_subject_npz(
+def scan_npz_metadata(
     npz_dir: str,
     subjects: Optional[List[str]] = None,
     pattern: str = "*.npz",
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
-    """Load and concatenate multiple subject npz files from a directory.
+) -> Tuple[List[Path], np.ndarray, np.ndarray, list, np.ndarray]:
+    """Scan all per-subject npz files, load ONLY y/s/meta (skip X).
 
-    If subjects is None, loads all .npz files found.
-    Returns (X_all, y_all, s_all, meta_all).
+    Returns:
+      npz_paths: list of Path (sorted)
+      y_all:     (N_total,) int64
+      s_all:     (N_total,) float32
+      meta_all:  list[dict], length N_total
+      file_map:  (N_total, 2) int64  — each row = (file_idx, local_idx)
     """
     d = Path(npz_dir)
     if subjects:
@@ -57,35 +50,159 @@ def load_multi_subject_npz(
             p = d / f"{s}.npz"
             if p.exists():
                 paths.append(p)
-            else:
-                print(f"[WARN] Subject npz not found: {p}")
     else:
         paths = sorted(d.glob(pattern))
 
     if not paths:
         raise FileNotFoundError(f"No npz files found in {npz_dir}")
 
-    X_list, y_list, s_list, meta_all = [], [], [], []
-    for p in paths:
-        X, y, s, meta = load_subject_npz(str(p))
-        X_list.append(X)
-        y_list.append(y)
-        s_list.append(s)
-        meta_all.extend(meta)
-        print(f"[LOAD] {p.name}: {X.shape[0]} windows")
+    y_parts, s_parts, meta_all = [], [], []
+    file_map_parts = []
 
-    return (np.concatenate(X_list, axis=0),
-            np.concatenate(y_list, axis=0),
-            np.concatenate(s_list, axis=0),
-            meta_all)
+    for fi, p in enumerate(paths):
+        data = np.load(p, allow_pickle=True)
+        y = data["y"]
+        s = data["s"]
+        meta_raw = data["meta"]
+        n = len(y)
+
+        y_parts.append(y.astype(np.int64))
+        s_parts.append(s.astype(np.float32))
+        meta_all.extend([json.loads(m) for m in meta_raw])
+        file_map_parts.append(
+            np.column_stack([np.full(n, fi, dtype=np.int64),
+                             np.arange(n, dtype=np.int64)])
+        )
+        print(f"[SCAN] {p.name}: {n} windows (y/s/meta only, X skipped)")
+        # 显式关闭 npz 避免 fd 泄漏
+        del data, y, s, meta_raw
+        gc.collect()
+
+    y_all = np.concatenate(y_parts, axis=0)
+    s_all = np.concatenate(s_parts, axis=0)
+    file_map = np.concatenate(file_map_parts, axis=0)
+
+    print(f"[SCAN] Total: {len(y_all)} windows across {len(paths)} files, "
+          f"y/s/meta RAM ≈ {(y_all.nbytes + s_all.nbytes + file_map.nbytes) / 1024**2:.1f} MB")
+
+    return paths, y_all, s_all, meta_all, file_map
 
 
 # --------------------------------------------------------------------------
-# Dataset
+# Memmap-backed X array: 解压 npz → .npy → memmap
+# --------------------------------------------------------------------------
+
+class MmapXStore:
+    """Manage memory-mapped access to X arrays across multiple npz files.
+
+    对每个 npz 文件，将其中的 X 数组解压为一个独立的 .npy 文件（放在 cache_dir），
+    然后用 np.memmap 打开。内存占用 ≈ 0（由 OS 页面缓存管理）。
+
+    磁盘开销 = 原始 X 数据的 uncompressed 大小（float32）。
+    对 20 × 3660 × 62 × 800 × 4B ≈ 13.6 GB，但这是顺序写、随机读，
+    比全量 RAM 安全得多。
+    """
+
+    def __init__(self, npz_paths: List[Path], cache_dir: Optional[str] = None):
+        if cache_dir:
+            self._cache_dir = Path(cache_dir)
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            self._owned = False      # 用户管理生命周期
+        else:
+            self._tmp = tempfile.mkdtemp(prefix="eeg_mmap_")
+            self._cache_dir = Path(self._tmp)
+            self._owned = True       # 我们自己清理
+
+        self._mmaps: List[np.memmap] = []
+        self._counts: List[int] = []
+
+        for fi, p in enumerate(npz_paths):
+            npy_path = self._cache_dir / f"{p.stem}_X.npy"
+
+            if npy_path.exists():
+                # 已经解压过，直接 memmap
+                mm = np.load(str(npy_path), mmap_mode="r")
+            else:
+                # 从 npz 解压 X 并保存为独立 .npy
+                data = np.load(p, allow_pickle=True)
+                X = data["X"]
+                np.save(str(npy_path), X.astype(np.float32))
+                del data, X
+                gc.collect()
+                mm = np.load(str(npy_path), mmap_mode="r")
+
+            self._mmaps.append(mm)
+            self._counts.append(mm.shape[0])
+            print(f"[MMAP] {p.stem}: shape={mm.shape}, "
+                  f"npy={npy_path.stat().st_size / 1024**2:.1f} MB (memmap, ~0 RAM)")
+
+        total_npy = sum((self._cache_dir / f).stat().st_size
+                        for f in os.listdir(self._cache_dir) if f.endswith(".npy"))
+        print(f"[MMAP] Cache dir: {self._cache_dir}, "
+              f"total .npy disk = {total_npy / 1024**3:.2f} GB")
+
+    def get(self, file_idx: int, local_idx: int) -> np.ndarray:
+        """Read one window: returns (62, 800) float32 (zero-copy from mmap)."""
+        return self._mmaps[file_idx][local_idx]
+
+    def close(self):
+        for mm in self._mmaps:
+            del mm
+        self._mmaps.clear()
+        gc.collect()
+        if self._owned and hasattr(self, "_tmp"):
+            shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# OOM-safe Dataset: memmap-backed
+# --------------------------------------------------------------------------
+
+class EEGMmapDataset(Dataset):
+    """Zero-RAM dataset backed by memory-mapped .npy files.
+
+    每次 __getitem__ 从 memmap 读一条 (62, 800) 切片，
+    OS 页面缓存自动管理，不会 OOM。
+    """
+
+    def __init__(
+        self,
+        x_store: MmapXStore,
+        file_map: np.ndarray,       # (N, 2) int64: (file_idx, local_idx)
+        y: np.ndarray,              # (N,) int64
+        s: np.ndarray,              # (N,) float32
+        indices: Optional[np.ndarray] = None,
+    ):
+        self.x_store = x_store
+        self.file_map = file_map
+        self.y = y
+        self.s = s
+        self.indices = indices if indices is not None else np.arange(len(y))
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        i = self.indices[idx]
+        fi, li = int(self.file_map[i, 0]), int(self.file_map[i, 1])
+        x = self.x_store.get(fi, li)                         # (62, 800) float32
+        x_t = torch.from_numpy(np.ascontiguousarray(x)).unsqueeze(0)  # (1, 62, 800)
+        return x_t, torch.tensor(self.y[i], dtype=torch.long), \
+               torch.tensor(self.s[i], dtype=torch.float32)
+
+
+# --------------------------------------------------------------------------
+# 兼容的小规模 in-memory Dataset（单被试调试用）
 # --------------------------------------------------------------------------
 
 class EEGWindowArrayDataset(Dataset):
-    """In-memory dataset over a subset of preprocessed windows."""
+    """In-memory dataset (仅用于单被试或极小数据集调试)."""
 
     def __init__(self, X: np.ndarray, y: np.ndarray, s: np.ndarray,
                  indices: Optional[np.ndarray] = None):
@@ -99,8 +216,7 @@ class EEGWindowArrayDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         i = self.indices[idx]
-        x = self.X[i].unsqueeze(0)  # (1, 62, 800)
-        return x, self.y[i], self.s[i]
+        return self.X[i].unsqueeze(0), self.y[i], self.s[i]
 
 
 # --------------------------------------------------------------------------
@@ -125,12 +241,8 @@ def split_trials_from_meta(
 ) -> Dict[str, np.ndarray]:
     """Split window indices by trial membership to avoid data leakage.
 
-    Design.md 原则：先切分 trial 列表，再在各自集合内独立做窗口化和归一化。
-    由于预处理已在 per-subject 级别完成（z-score 独立），这里只需按 trial 分割索引。
-
     Returns dict with keys 'train', 'val', 'test' -> np.ndarray of window indices.
     """
-    # Extract unique trial keys and their window indices
     trial_to_windows: Dict[Tuple[str, int, int], List[int]] = {}
     for i, m in enumerate(meta):
         key = (str(m["subject"]), int(m["session_id"]), int(m["trial_id"]))
@@ -240,10 +352,7 @@ def iter_trials_from_mat(mat_path: str) -> Iterator[TrialData]:
 
 
 def load_save_info_intensity(save_info_dir: str) -> Dict[Tuple[str, int, int], float]:
-    """Load continuous intensity labels from save_info CSV files.
-
-    Returns {(subject, session_id, trial_id): mean_intensity}.
-    """
+    """Load continuous intensity labels from save_info CSV files."""
     import csv
     d = Path(save_info_dir)
     result: Dict[Tuple[str, int, int], float] = {}

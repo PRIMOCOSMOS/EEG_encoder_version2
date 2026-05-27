@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Train (or resume) the SEED-VII dual-head model.
+"""Train (or resume) the SEED-VII dual-head model — OOM-safe 流式版.
 
-重构版：从 per-subject .npz 目录加载数据。
+核心：不一次性加载全部 X 到 RAM，用 memmap 流式读取。
 
 用法:
   python scripts/train.py \
@@ -25,7 +25,7 @@ from src.trainer import TrainConfig, run_training
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train SEED-VII dual-head model")
+    p = argparse.ArgumentParser(description="Train SEED-VII dual-head model (OOM-safe)")
     p.add_argument("--data-dir", type=str, required=True,
                    help="Directory containing per-subject .npz files")
     p.add_argument("--output-dir", type=str, default=str(TRAIN_DEFAULTS["output_dir"]))
@@ -81,6 +81,9 @@ def parse_args():
                    help="Model architecture: 'eegnet' (default) or 'conformer'")
     p.add_argument("--val-ratio", type=float, default=float(TRAIN_DEFAULTS["val_ratio"]))
     p.add_argument("--test-ratio", type=float, default=float(TRAIN_DEFAULTS["test_ratio"]))
+    p.add_argument("--mmap-cache-dir", type=str, default="",
+                   help="Directory for memmap .npy cache (default: output_dir/_mmap_cache). "
+                        "Set to a fast disk for best I/O performance.")
     args = p.parse_args()
 
     amp = bool(TRAIN_DEFAULTS["amp"])
@@ -112,6 +115,7 @@ def parse_args():
         freeze_intensity_head=bool(args.freeze_intensity_head),
         model_type=args.model_type,
         val_ratio=args.val_ratio, test_ratio=args.test_ratio,
+        mmap_cache_dir=args.mmap_cache_dir,
     )
 
 

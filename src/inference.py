@@ -1,4 +1,4 @@
-"""Encoder inference: dump embeddings + class/intensity predictions."""
+"""Encoder inference: dump embeddings + class/intensity predictions — OOM-safe."""
 from __future__ import annotations
 import json
 from pathlib import Path
@@ -6,23 +6,12 @@ from typing import Optional
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 from .config import CONFORMER_CONFIG, EEGNET_CONFIG
-from .dataset import load_multi_subject_npz
+from .dataset import EEGMmapDataset, MmapXStore, scan_npz_metadata
 from .model import build_model
 from .trainer import resolve_device
-
-
-class _EEGOnly(Dataset):
-    def __init__(self, x: np.ndarray):
-        self.x = torch.from_numpy(x).float()
-
-    def __len__(self) -> int:
-        return self.x.shape[0]
-
-    def __getitem__(self, idx: int):
-        return self.x[idx].unsqueeze(0)
 
 
 @torch.no_grad()
@@ -36,12 +25,19 @@ def encode_from_npz_dir(
     device_arg: str = "auto",
     use_amp: bool = False,
     subjects: Optional[str] = None,
+    mmap_cache_dir: str = "",
 ) -> None:
     device = resolve_device(device_arg)
     use_amp = bool(use_amp and device.type == "cuda")
 
     subj_list = [s.strip() for s in subjects.split(",")] if subjects else None
-    x, y, s, meta = load_multi_subject_npz(data_dir, subjects=subj_list)
+
+    # Lightweight scan — only y/s/meta
+    npz_paths, y, s, meta, file_map = scan_npz_metadata(data_dir, subjects=subj_list)
+
+    # Memmap X store
+    cache_dir = mmap_cache_dir if mmap_cache_dir else None
+    x_store = MmapXStore(npz_paths, cache_dir=cache_dir)
 
     cfg = EEGNET_CONFIG if model_type == "eegnet" else CONFORMER_CONFIG
     model = build_model(model_type, cfg).to(device)
@@ -50,11 +46,11 @@ def encode_from_npz_dir(
     model.load_state_dict(ck["model"] if "model" in ck else ck)
     model.eval()
 
-    ds = _EEGOnly(x)
+    ds = EEGMmapDataset(x_store, file_map, y, s)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     feats, cls_preds, int_preds = [], [], []
-    for xb in loader:
+    for xb, yb, sb in loader:
         xb = xb.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, enabled=use_amp):
             f = model.encode(xb, feature_type=feature_type)
@@ -81,3 +77,5 @@ def encode_from_npz_dir(
         model_type=np.asarray(model_type),
     )
     print(f"[DONE] features={F_arr.shape} -> {out}")
+
+    x_store.close()

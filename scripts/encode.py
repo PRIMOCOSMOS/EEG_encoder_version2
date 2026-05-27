@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Encode windows into features using a trained checkpoint.
-
-用法:
-  python scripts/encode.py \
-    --data-dir /workspace/preprocessed \
-    --checkpoint /workspace/runs/best_encoder.pt \
-    --output /workspace/encoded.npz \
-    --model-type eegnet
-"""
+"""Encode windows into features using a trained checkpoint — OOM-safe."""
 from __future__ import annotations
 import argparse, sys
 from pathlib import Path
@@ -19,7 +11,7 @@ from src.inference import encode_from_npz_dir
 
 
 def main():
-    p = argparse.ArgumentParser(description="Encode SEED-VII windows")
+    p = argparse.ArgumentParser(description="Encode SEED-VII windows (OOM-safe)")
     p.add_argument("--data-dir", required=True,
                    help="Directory containing per-subject .npz files")
     p.add_argument("--checkpoint", required=True)
@@ -31,6 +23,8 @@ def main():
     p.add_argument("--amp", action="store_true")
     p.add_argument("--subjects", type=str, default=None,
                    help="Comma-separated subject IDs to encode (default: all)")
+    p.add_argument("--mmap-cache-dir", type=str, default="",
+                   help="Directory for memmap .npy cache")
     args = p.parse_args()
 
     encode_from_npz_dir(
@@ -43,6 +37,7 @@ def main():
         device_arg=args.device,
         use_amp=args.amp,
         subjects=args.subjects,
+        mmap_cache_dir=args.mmap_cache_dir,
     )
 
 

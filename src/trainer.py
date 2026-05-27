@@ -1,10 +1,11 @@
-"""Training loop for SEED-VII dual-head model (EEGNet or EEGConformer).
+"""Training loop for SEED-VII dual-head model — OOM-safe 流式版.
 
-重构版：
-- 从 per-subject .npz 目录加载数据
-- Trial-level 划分避免数据泄漏
-- 支持被试筛选（跨被试/被试内训练）
-- 断点续训 / 软超时 / 周期保存
+核心改造：
+- 不再一次性 np.concatenate 全部 X 到 RAM (13.6 GB → OOM Killed)
+- Pass 1: scan_npz_metadata 只加载 y/s/meta (< 50 MB)
+- Pass 2: MmapXStore 将每个 npz 的 X 解压为 .npy → memmap (内存 ≈ 0)
+- EEGMmapDataset.__getitem__ 从 memmap 按需读一条，OS 页面缓存管理
+- 训练循环不变
 """
 from __future__ import annotations
 
@@ -20,9 +21,10 @@ from torch.utils.data import DataLoader
 
 from .config import CONFORMER_CONFIG, EEGNET_CONFIG, TRAIN_DEFAULTS
 from .dataset import (
-    EEGWindowArrayDataset,
+    EEGMmapDataset,
+    MmapXStore,
     filter_by_subjects,
-    load_multi_subject_npz,
+    scan_npz_metadata,
     split_trials_from_meta,
 )
 from .losses import LossConfig, WeightedDualLoss
@@ -74,6 +76,7 @@ class TrainConfig:
     model_type: str = str(TRAIN_DEFAULTS["model_type"])
     val_ratio: float = float(TRAIN_DEFAULTS["val_ratio"])
     test_ratio: float = float(TRAIN_DEFAULTS["test_ratio"])
+    mmap_cache_dir: str = ""    # memmap 缓存目录（默认: output_dir/_mmap_cache）
 
 
 # --------------------------------------------------------------------------
@@ -237,7 +240,7 @@ def make_loader(ds, bs, shuffle, nw, pin=False, pw=False):
 
 
 # --------------------------------------------------------------------------
-# MAIN TRAINING ORCHESTRATOR
+# MAIN TRAINING ORCHESTRATOR — OOM-safe
 # --------------------------------------------------------------------------
 
 def run_training(cfg: TrainConfig) -> Dict[str, object]:
@@ -279,28 +282,37 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # ================================================================
-    # STEP 1: 加载数据（per-subject npz 目录）
+    # STEP 1: 轻量扫描 — 只加载 y/s/meta (< 50 MB)，X 不碰
     # ================================================================
     train_subj = _parse_subjects(cfg.train_subjects)
     val_subj = _parse_subjects(cfg.val_subjects)
     test_subj = _parse_subjects(cfg.test_subjects)
 
-    # 确定加载哪些被试
     all_subjects = None
     if train_subj or val_subj or test_subj:
         all_subjects = list(set(train_subj + val_subj + test_subj))
-    X_full, y_full, s_full, meta = load_multi_subject_npz(
+
+    npz_paths, y_all, s_all, meta, file_map = scan_npz_metadata(
         str(cfg.data_dir), subjects=all_subjects)
-    n_total = len(y_full)
-    logger.info(f"Data: X shape={X_full.shape}, N={n_total}")
+    n_total = len(y_all)
+    logger.info(f"Data: N={n_total} windows across {len(npz_paths)} files "
+                f"(y/s/meta only, X not loaded yet)")
 
     # ================================================================
-    # STEP 2: 确定 indices
+    # STEP 2: 构建 memmap X store — 解压 npz→.npy→memmap，≈0 RAM
+    # ================================================================
+    mmap_dir = cfg.mmap_cache_dir if cfg.mmap_cache_dir else \
+        str(cfg.output_dir / "_mmap_cache")
+    logger.info(f"[MMAP] Building memmap X store at {mmap_dir} ...")
+    x_store = MmapXStore(npz_paths, cache_dir=mmap_dir)
+    logger.info(f"[MMAP] Done. X data served via memmap (RAM ≈ 0).")
+
+    # ================================================================
+    # STEP 3: 确定 train/val/test indices
     # ================================================================
     use_subj_filter = bool(train_subj or val_subj or test_subj)
 
     if use_subj_filter:
-        # 按被试划分
         all_subj_in_data = sorted(set(str(m.get("subject", "")) for m in meta))
         if train_subj:
             train_idx = filter_by_subjects(meta, train_subj)
@@ -328,35 +340,47 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 test_idx = np.sort(rng.choice(pool, size=min(n_test, len(pool)), replace=False))
             else:
                 test_idx = np.array([], dtype=np.int64)
-        logger.info(f"[SUBJECT-FILTER] train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+        logger.info(f"[SUBJECT-FILTER] train={len(train_idx)}, "
+                     f"val={len(val_idx)}, test={len(test_idx)}")
     else:
-        # Trial-level 划分
         splits = split_trials_from_meta(meta, val_ratio=cfg.val_ratio,
                                         test_ratio=cfg.test_ratio, seed=cfg.seed)
         train_idx = splits["train"]
         val_idx = splits["val"]
         test_idx = splits["test"]
-        logger.info(f"[TRIAL-SPLIT] train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+        logger.info(f"[TRIAL-SPLIT] train={len(train_idx)}, "
+                     f"val={len(val_idx)}, test={len(test_idx)}")
 
     if len(val_idx) == 0:
         logger.error("Empty val set.")
+        x_store.close()
         return {"error": "empty val"}
     if len(train_idx) == 0:
         logger.error("Empty train set.")
+        x_store.close()
         return {"error": "empty train"}
 
     # ================================================================
-    # STEP 3: 创建 Dataset 和 DataLoader
+    # STEP 4: 创建 Dataset 和 DataLoader (memmap-backed, ≈0 RAM)
     # ================================================================
-    train_ds = EEGWindowArrayDataset(X_full, y_full, s_full, indices=train_idx)
-    val_ds = EEGWindowArrayDataset(X_full, y_full, s_full, indices=val_idx)
-    test_ds = EEGWindowArrayDataset(X_full, y_full, s_full, indices=test_idx) \
+    train_ds = EEGMmapDataset(x_store, file_map, y_all, s_all, indices=train_idx)
+    val_ds = EEGMmapDataset(x_store, file_map, y_all, s_all, indices=val_idx)
+    test_ds = EEGMmapDataset(x_store, file_map, y_all, s_all, indices=test_idx) \
         if len(test_idx) > 0 else None
 
+    # num_workers=0 避免 memmap 在 fork 子进程中出问题
+    # 如果要 num_workers > 0，需要确认 memmap 在 fork 后是安全的
     nw = min(cfg.num_workers, 2)
-    train_loader = make_loader(train_ds, cfg.batch_size, True, nw)
-    val_loader = make_loader(val_ds, cfg.batch_size, False, nw)
-    test_loader = make_loader(test_ds, cfg.batch_size, False, nw) if test_ds else None
+    train_loader = make_loader(train_ds, cfg.batch_size, True, nw,
+                               pin=cfg.pin_memory)
+    val_loader = make_loader(val_ds, cfg.batch_size, False, nw,
+                              pin=cfg.pin_memory)
+    test_loader = make_loader(test_ds, cfg.batch_size, False, nw,
+                               pin=cfg.pin_memory) if test_ds else None
+
+    logger.info(f"[LOADER] train={len(train_ds)}, val={len(val_ds)}, "
+                f"test={len(test_ds) if test_ds else 0}, "
+                f"batch_size={cfg.batch_size}, num_workers={nw}")
 
     state_path = Path(cfg.resume_path) if cfg.resume_path else (cfg.output_dir / "train_state.pt")
     best_model_path = cfg.output_dir / "best_model.pt"
@@ -394,7 +418,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     deadline_ts = t0 + cfg.max_runtime_hours * 3600 if cfg.max_runtime_hours > 0 else None
 
     # ================================================================
-    # STEP 4: 训练循环
+    # STEP 5: 训练循环
     # ================================================================
     last_epoch = start_epoch - 1
     for epoch in range(start_epoch, cfg.max_epochs + 1):
@@ -474,4 +498,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     logger.info(f"Summary -> {summary_path}")
+
+    # Cleanup memmap
+    x_store.close()
+
     return summary
