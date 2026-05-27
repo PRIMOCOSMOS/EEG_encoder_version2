@@ -1,2 +1,1 @@
-"""SEED-VII EEG Conformer encoder package."""
-__version__ = "0.1.0"
+# EEG encoder for SEED-VII

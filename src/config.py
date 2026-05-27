@@ -1,17 +1,10 @@
-"""Central configuration for SEED-VII preprocessing, model, and training.
-
-EEGNet 替代方案（缓解过拟合）：
-  - 原 EEG-Conformer（~0.75M 参数，6 层 Transformer）→ EEGNet（~5K 参数，纯卷积）
-  - 深度可分离卷积 + 强 Dropout(0.5) + BatchNorm
-  - 归纳偏置更强，更适合小样本/跨被试场景
-"""
+"""Central configuration for SEED-VII preprocessing, model, and training."""
 from __future__ import annotations
-
 from typing import Dict
 
-# ---------------------------------------------------------------------------
-# 预处理
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Preprocessing
+# --------------------------------------------------------------------------
 PREPROCESS_DEFAULTS: Dict[str, object] = {
     "fs": 200,                    # SEED-VII EEG_preprocessed 已 200Hz
     "window_seconds": 4.0,        # 4 秒窗口
@@ -20,7 +13,7 @@ PREPROCESS_DEFAULTS: Dict[str, object] = {
     "max_windows_per_trial": 60,  # 防长视频主导：每 clip 至多 N 个窗口
     "use_car": True,              # 平均参考
     "use_baseline_correct": True, # 基线去均值
-    "use_ica": True,              # ICA 较慢，默认关闭
+    "use_ica": False,             # ICA（默认关闭，耗时）
     "ica_components": 20,
     "ica_remove": 5,
     "per_channel_zscore": True,   # 按通道 z-score（优先方案）
@@ -28,24 +21,24 @@ PREPROCESS_DEFAULTS: Dict[str, object] = {
     "save_float32": True,
 }
 
-# ---------------------------------------------------------------------------
-# EEGNet 模型配置（替代 EEG-Conformer，Lawhern et al. 2018）
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# EEGNet 模型配置（轻量，≈5K 参数，适合小样本 / 跨被试）
+# --------------------------------------------------------------------------
 EEGNET_CONFIG: Dict[str, object] = {
     "n_channels": 62,
-    "n_timepoints": 800,       # 4s * 200Hz
-    "n_classes": 7,            # SEED-VII 7 类情绪
-    "F1": 8,                   # 时间滤波器数量
-    "D": 2,                    # 深度乘子
-    "F2": 16,                  # 通常 F2 = F1 * D
-    "kernLength": 100,         # 200Hz raw EEG，0.5秒感受野
-    "dropout": 0.5,            # 跨被试建议 0.5；被试内可 0.25
+    "n_timepoints": 800,          # 4s * 200Hz
+    "n_classes": 7,               # SEED-VII 7 类情绪
+    "F1": 8,                      # 时间滤波器数量
+    "D": 2,                       # 深度乘子
+    "F2": 16,                     # 通常 F2 = F1 * D
+    "kernLength": 100,            # 200Hz raw EEG，0.5秒感受野
+    "dropout": 0.5,               # 跨被试建议 0.5；被试内可 0.25
     "intensity_head_hidden": 64,
 }
 
-# ---------------------------------------------------------------------------
-# EEG-Conformer 配置（保留备用，如需切换回来）
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# EEGConformer 配置（≈0.75M 参数，全 Transformer 编码器）
+# --------------------------------------------------------------------------
 CONFORMER_CONFIG: Dict[str, object] = {
     "n_channels": 62,
     "n_timepoints": 800,
@@ -72,32 +65,29 @@ CONFORMER_CONFIG["n_tokens"] = compute_token_count(
     int(CONFORMER_CONFIG["pool_stride"]),
 )
 
-# ---------------------------------------------------------------------------
-# 训练
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Training
+# --------------------------------------------------------------------------
 TRAIN_DEFAULTS: Dict[str, object] = {
-    "output_dir": "runs_seed_vii_eegnet",  # 改为 EEGNet
+    "output_dir": "runs_seed_vii",
     "device": "auto",
     "amp": True,
     "seed": 42,
     "batch_size": 256,
     "num_workers": 2,
-
     # 优化器
     "optimizer": "adam",
     "lr": 2e-4,
     "min_lr": 1e-5,
     "beta1": 0.5,
     "beta2": 0.999,
-    "weight_decay": 1e-4,  # EEGNet 加入 weight decay 防止过拟合
+    "weight_decay": 1e-4,
     "grad_clip": 1.0,
-
     # 训练阶段
     "pretrain_epochs": 10,
     "max_epochs": 200,
     "patience": 30,
-
-    # 损失权重（联合训练）
+    # 损失权重
     "alpha_cls_start": 1.0,
     "beta_reg_start": 0.5,
     "gamma_rank_start": 0.0,
@@ -106,34 +96,29 @@ TRAIN_DEFAULTS: Dict[str, object] = {
     "enable_rank": False,
     "rank_margin": 0.05,
     "label_smoothing": 0.05,
-
     # 样本权重
     "sample_weight_mode": "continuous",
     "intensity_threshold": 0.5,
     "weak_sample_weight": 0.1,
-
     # 划分
     "val_ratio": 0.1,
     "test_ratio": 0.1,
     "split_unit": "trial",
-
     # 续训 / 容错
     "save_interval": 1,
     "max_runtime_hours": 10.0,
     "save_last": True,
     "save_features": False,
     "feature_type": "projected",
-
-    # DataLoader OOM 修复
+    # DataLoader
     "pin_memory": False,
     "persistent_workers": False,
-
-    # 过拟合缓解
-    "freeze_intensity_head": False,
+    # 模型选择
+    "model_type": "eegnet",  # ["eegnet", "conformer"]
+    # 被试筛选
     "train_subjects": "",
     "val_subjects": "",
     "test_subjects": "",
-
-    # 模型选择
-    "model_type": "eegnet",  # 默认使用 EEGNet ["eegnet", "conformer"]
+    # 过拟合缓解
+    "freeze_intensity_head": False,
 }

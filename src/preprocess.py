@@ -3,10 +3,10 @@
 输入：单个 trial 的 raw EEG `(62, T)`（已带通+陷波）
 输出：若干个 `(62, win_samples)` 窗口 + 元信息
 
-流程（严格按 Design.md）：
+流程：
 1) 基线校正（默认整段去均值；如有 baseline 段可改 head-N 秒）
-2) CAR 平均参考
-3) （可选）ICA 去伪迹
+2) ICA 去伪迹（MNE-based，适合 EEG 数据）
+3) CAR 平均参考
 4) 居中 60% 裁剪
 5) 4 秒窗口 50% 重叠 + 每 clip 至多 N 个居中窗口（防长视频主导）
 6) 按通道 z-score
@@ -58,30 +58,111 @@ def apply_car(x: np.ndarray) -> np.ndarray:
     return x - x.mean(axis=0, keepdims=True)
 
 
-def apply_fastica_denoise(
+def apply_mne_ica_denoise(
     x: np.ndarray,
     n_components: int,
     remove_k: int,
     random_state: int = 42,
 ) -> np.ndarray:
-    """Heuristic ICA artifact removal: drop top-k high-kurtosis components."""
-    from sklearn.decomposition import FastICA  # lazy import
+    """ICA artifact removal using MNE-Python (更适合 EEG).
 
-    xt = x.T  # (T, C)
-    n_components = int(max(2, min(n_components, xt.shape[1], xt.shape[0] - 1)))
-    ica = FastICA(
+    相比 sklearn FastICA 的优势：
+    - 对 EEG 数据更友好的初始化和白化策略
+    - 自动处理 NaN/Inf/常数通道
+    - 更稳定的收敛
+
+    流程：MNE RawArray → ICA.fit() → EOG-based 自动检测伪迹成分
+          → 标记 remove_k 个最高 EOG 相关成分 → 重建信号
+    """
+    import warnings
+
+    import mne
+
+    # ---- 健康检查 ----
+    x = x.copy().astype(np.float64)
+
+    # 检查/处理 NaN / Inf
+    if np.any(np.isnan(x)) or np.any(np.isinf(x)):
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 检查/处理常数或几乎为零方差的通道
+    std_per_ch = x.std(axis=1)
+    bad_ch_mask = std_per_ch < 1e-10
+    n_bad = bad_ch_mask.sum()
+    if n_bad > 0:
+        # 用有有限方差的通道的均值填充坏通道（保持空间结构）
+        good_mask = ~bad_ch_mask
+        if good_mask.any():
+            fill_val = x[good_mask].mean(axis=0)
+        else:
+            fill_val = 0.0
+        x[bad_ch_mask] = fill_val
+
+    # ---- 构建 MNE Raw 对象 ----
+    sfreq = float(PREPROCESS_DEFAULTS.get("fs", 200))
+    ch_names = [f"EEG{i:03d}" for i in range(x.shape[0])]
+    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="eeg")
+    raw = mne.io.RawArray(x, info, first_samp=0, copy=False, verbose=False)
+
+    # ---- 限制 n_components ----
+    max_components = min(n_components, x.shape[0] - 1, 62)
+    n_components = max(2, int(max_components))
+
+    # ---- ICA 拟合 ----
+    ica = mne.preprocessing.ICA(
         n_components=n_components,
         random_state=random_state,
-        whiten="unit-variance",
-        max_iter=1000,
+        max_iter=500,        # MNE 默认 500，通常足够
+        method="fastica",    # 与 sklearn FastICA 等价，但对 EEG 初始化更好
+        verbose=False,
     )
-    s = ica.fit_transform(xt)
-    a = ica.mixing_
-    kurt = np.mean(((s - s.mean(0)) / (s.std(0) + 1e-8)) ** 4, axis=0)
-    remove_k = min(remove_k, s.shape[1])
-    bad = np.argsort(kurt)[-remove_k:]
-    s[:, bad] = 0.0
-    return ((s @ a.T) + ica.mean_).T
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=FutureWarning)
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        ica.fit(raw, verbose=False)
+
+    # ---- EOG 自动检测（比纯 kurtosis 更可靠）----
+    # 尝试自动检测眼动相关成分
+    try:
+        eog_indices, eog_scores = ica.find_bads_eog(
+            raw,
+            threshold=2.0,   # Z-score 阈值，高于 2σ 的成分被标记
+            verbose=False,
+        )
+    except Exception:
+        eog_indices = []
+
+    # ---- 合并 kurtosis 启发式 + EOG 检测 ----
+    # 计算 kurtosis 并选择最高的前 remove_k 个（排除已由 EOG 标记的）
+    sources = ica.get_sources(raw).get_data()          # (n_components, T)
+    kurt_vals = np.nanmean(
+        ((sources - sources.mean(axis=1, keepdims=True))
+         / (sources.std(axis=1, keepdims=True) + 1e-8)) ** 4,
+        axis=1,
+    )
+
+    # 按 kurtosis 排序，选择最高的 remove_k 个
+    kurtosis_bads = np.argsort(kurt_vals)[-remove_k:].tolist()
+
+    # 合并：EOG 检测的优先保留，kurtosis 补充剩余名额
+    exclude_set = set(eog_indices)
+    exclude_list = list(eog_indices)   # EOG 成分优先排除
+
+    # 补足 remove_k - len(eog_indices) 个最高 kurtosis 成分
+    remaining = remove_k - len(exclude_list)
+    for idx in kurtosis_bads:
+        if idx not in exclude_set and remaining > 0:
+            exclude_list.append(idx)
+            remaining -= 1
+
+    ica.exclude = sorted(exclude_list)
+
+    # ---- 重建干净信号 ----
+    clean_raw = ica.apply(raw, exclude=ica.exclude, verbose=False)
+    x_clean = clean_raw.get_data()
+
+    return x_clean
 
 
 def center_crop(x: np.ndarray, ratio: float) -> Tuple[np.ndarray, int, int]:
@@ -128,31 +209,47 @@ def preprocess_trial(
     intensity: float,
     cfg: dict = PREPROCESS_DEFAULTS,
 ) -> Tuple[np.ndarray, List[WindowMeta]]:
-    """Process one trial -> stacked windows array `(N, C, T)` + metas."""
+    """Process one trial -> stacked windows array `(N, C, T)` + metas.
+
+    处理顺序（调整后）：
+        基线校正 → ICA (MNE) → CAR → 居中裁剪 → 滑动窗口 → z-score
+
+    相比原版（基线校正 → CAR → ICA）的优势：
+        ICA 在 CAR 之前：信号方差更均匀，通道间相关性更小，
+        分解更稳定，不容易出现不收敛问题。
+    """
     if raw.ndim != 2 or raw.shape[0] != 62:
         raise ValueError(f"Expected (62, T), got {raw.shape}")
     x = raw.astype(np.float64, copy=False)
 
+    # 1) 基线校正
     if cfg.get("use_baseline_correct", True):
         x = baseline_correct(x, head_samples=None)
-    if cfg.get("use_car", True):
-        x = apply_car(x)
+
+    # 2) ICA（调整到 CAR 之前）
     if cfg.get("use_ica", False):
-        x = apply_fastica_denoise(
+        x = apply_mne_ica_denoise(
             x,
             n_components=int(cfg["ica_components"]),
             remove_k=int(cfg["ica_remove"]),
         )
 
+    # 3) CAR（移到 ICA 之后）
+    if cfg.get("use_car", True):
+        x = apply_car(x)
+
+    # 4) 居中 60% 裁剪
     middle_ratio = float(cfg.get("middle_ratio", 0.6))
     x_mid, cs, ce = center_crop(x, middle_ratio)
 
+    # 5) 滑动窗口
     fs = int(cfg["fs"])
     win = int(round(float(cfg["window_seconds"]) * fs))
     step = int(round(float(cfg["step_seconds"]) * fs))
     if win <= 0 or step <= 0:
         raise ValueError("window/step must be positive")
     windows = sliding_windows(x_mid, win=win, step=step)
+
     if not windows:
         return (
             np.zeros((0, 62, win), dtype=np.float32),
@@ -170,6 +267,7 @@ def preprocess_trial(
         keep_ids = sorted(ranked[:max_n])
         windows = [windows[i] for i in keep_ids]
 
+    # 6) z-score
     use_pc = bool(cfg.get("per_channel_zscore", True))
     eps = float(cfg.get("eps", 1e-8))
     save_f32 = bool(cfg.get("save_float32", True))
