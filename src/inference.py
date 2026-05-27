@@ -3,22 +3,24 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import List, Optional
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .config import CONFORMER_CONFIG, EEGNET_CONFIG
-from .dataset import EEGWindowArrayDataset, load_dataset_npz
+from .dataset import load_dataset_npz
 from .model import build_model
 from .trainer import resolve_device
 
 
 class _EEGOnly(Dataset):
-    """Minimal dataset for encoding (returns EEG tensor only, no labels)."""
     def __init__(self, x: np.ndarray):
         self.x = torch.from_numpy(x).float()
+
     def __len__(self) -> int:
         return self.x.shape[0]
+
     def __getitem__(self, idx: int):
         return self.x[idx].unsqueeze(0)
 
@@ -44,20 +46,15 @@ def encode_npz(
         x = x[sel]; y = y[sel]; s = s[sel]
         meta = [meta[i] for i in sel.tolist()]
 
-    # Select config based on model type
     cfg = EEGNET_CONFIG if model_type == "eegnet" else CONFORMER_CONFIG
-
     model = build_model(model_type, cfg).to(device)
+
     ck = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    if "model" in ck:
-        model.load_state_dict(ck["model"])
-    else:
-        model.load_state_dict(ck)
+    model.load_state_dict(ck["model"] if "model" in ck else ck)
     model.eval()
 
     ds = _EEGOnly(x)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                        num_workers=0, pin_memory=False)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
 
     feats, cls_preds, int_preds = [], [], []
     for xb in loader:

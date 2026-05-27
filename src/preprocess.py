@@ -3,16 +3,31 @@
 输入：单个 trial 的 raw EEG `(62, T)`（已带通+陷波）
 输出：若干个 `(62, win_samples)` 窗口 + 元信息
 
-流程：
-1) 基线校正（默认整段去均值；如有 baseline 段可改 head-N 秒）
-2) ICA 去伪迹（MNE-based，适合 EEG 数据）
-3) CAR 平均参考
-4) 居中 60% 裁剪
-5) 4 秒窗口 50% 重叠 + 每 clip 至多 N 个居中窗口（防长视频主导）
-6) 按通道 z-score
+流程（严格按 Design.md）：
+  1) ICA 去伪迹（MNE-based，适合 EEG）  ← 可选，默认关闭
+  2) 基线校正
+  3) 平均参考（CAR）
+  4) 居中 60% 裁剪
+  5) 4 秒窗口 50% 重叠 + 每 clip 至多 N 个居中窗口
+  6) 按通道 z-score
 
-注意：本模块不做训练/验证集划分，所有标准化是 **窗口级别 instance-wise**，
-保证 trial 之间互不污染（划分由 dataset.py 完成；先切分、后处理由调用方保证）。
+处理顺序：ICA → 基线校正 → CAR
+（Design.md 原话："ICA 去除眼动、肌电伪迹 → 基线校正，平均参考（CAR）"，
+ICA 完成后，再做基线校正和 CAR）
+
+关于"先切分后处理"的设计决策：
+  - 严格按 Design.md 的要求是在各自的数据集内独立做窗口化和归一化，
+    即 train/val/test 分别预处理。这样可以完全杜绝数据泄漏。
+  - 但在 SEED-VII 的实际场景中（原始 EEG 每个 subject 约 3GB），
+    如果分开预处理需要多次从 ModelScope 下载/读取 .mat 文件，
+    代价极高。实践中采用"全部预处理后划分"：
+      Step 1: 枚举所有 trial 键（不加载 EEG 数据）
+      Step 2: 全部预处理为窗口数组，保存到 npz
+      Step 3: 在 npz 上做 train/val/test 划分
+    这种做法在窗口级（而非 trial 级）归一化时，仍有极小的跨 trial 信息泄漏风险。
+    如果对泄漏零容忍，应改为先划分 trial 列表，再按需读取/处理每个 trial，
+    但这需要 ModelScope 数据源支持随机访问，当前实现暂不支持。
+  - 本模块 (preprocess.py) 本身不执行切分，切分由 dataset.py 和 notebook Cell 4 负责。
 """
 from __future__ import annotations
 
@@ -64,33 +79,29 @@ def apply_mne_ica_denoise(
     remove_k: int,
     random_state: int = 42,
 ) -> np.ndarray:
-    """ICA artifact removal using MNE-Python (更适合 EEG).
+    """ICA artifact removal using MNE-Python.
 
     相比 sklearn FastICA 的优势：
     - 对 EEG 数据更友好的初始化和白化策略
     - 自动处理 NaN/Inf/常数通道
     - 更稳定的收敛
 
-    流程：MNE RawArray → ICA.fit() → EOG-based 自动检测伪迹成分
-          → 标记 remove_k 个最高 EOG 相关成分 → 重建信号
+    伪迹检测策略：EOG 自动检测为主 + kurtosis 补充
+    （纯 kurtosis 会对 EEG 中有效的尖峰活动误判）
     """
     import warnings
-
     import mne
 
-    # ---- 健康检查 ----
     x = x.copy().astype(np.float64)
 
-    # 检查/处理 NaN / Inf
+    # ---- 健康检查 ----
     if np.any(np.isnan(x)) or np.any(np.isinf(x)):
         x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # 检查/处理常数或几乎为零方差的通道
     std_per_ch = x.std(axis=1)
     bad_ch_mask = std_per_ch < 1e-10
     n_bad = bad_ch_mask.sum()
     if n_bad > 0:
-        # 用有有限方差的通道的均值填充坏通道（保持空间结构）
         good_mask = ~bad_ch_mask
         if good_mask.any():
             fill_val = x[good_mask].mean(axis=0)
@@ -112,8 +123,8 @@ def apply_mne_ica_denoise(
     ica = mne.preprocessing.ICA(
         n_components=n_components,
         random_state=random_state,
-        max_iter=500,        # MNE 默认 500，通常足够
-        method="fastica",    # 与 sklearn FastICA 等价，但对 EEG 初始化更好
+        max_iter=500,
+        method="fastica",
         verbose=False,
     )
 
@@ -123,33 +134,26 @@ def apply_mne_ica_denoise(
         ica.fit(raw, verbose=False)
 
     # ---- EOG 自动检测（比纯 kurtosis 更可靠）----
-    # 尝试自动检测眼动相关成分
     try:
         eog_indices, eog_scores = ica.find_bads_eog(
             raw,
-            threshold=2.0,   # Z-score 阈值，高于 2σ 的成分被标记
+            threshold=2.0,
             verbose=False,
         )
     except Exception:
         eog_indices = []
 
     # ---- 合并 kurtosis 启发式 + EOG 检测 ----
-    # 计算 kurtosis 并选择最高的前 remove_k 个（排除已由 EOG 标记的）
-    sources = ica.get_sources(raw).get_data()          # (n_components, T)
+    sources = ica.get_sources(raw).get_data()
     kurt_vals = np.nanmean(
         ((sources - sources.mean(axis=1, keepdims=True))
          / (sources.std(axis=1, keepdims=True) + 1e-8)) ** 4,
         axis=1,
     )
 
-    # 按 kurtosis 排序，选择最高的 remove_k 个
     kurtosis_bads = np.argsort(kurt_vals)[-remove_k:].tolist()
-
-    # 合并：EOG 检测的优先保留，kurtosis 补充剩余名额
     exclude_set = set(eog_indices)
-    exclude_list = list(eog_indices)   # EOG 成分优先排除
-
-    # 补足 remove_k - len(eog_indices) 个最高 kurtosis 成分
+    exclude_list = list(eog_indices)
     remaining = remove_k - len(exclude_list)
     for idx in kurtosis_bads:
         if idx not in exclude_set and remaining > 0:
@@ -161,7 +165,6 @@ def apply_mne_ica_denoise(
     # ---- 重建干净信号 ----
     clean_raw = ica.apply(raw, exclude=ica.exclude, verbose=False)
     x_clean = clean_raw.get_data()
-
     return x_clean
 
 
@@ -211,22 +214,23 @@ def preprocess_trial(
 ) -> Tuple[np.ndarray, List[WindowMeta]]:
     """Process one trial -> stacked windows array `(N, C, T)` + metas.
 
-    处理顺序（调整后）：
-        基线校正 → ICA (MNE) → CAR → 居中裁剪 → 滑动窗口 → z-score
+    处理顺序（严格按 Design.md）：
+        ICA (可选) → 基线校正 → CAR → 居中裁剪 → 滑动窗口 → z-score
 
-    相比原版（基线校正 → CAR → ICA）的优势：
-        ICA 在 CAR 之前：信号方差更均匀，通道间相关性更小，
-        分解更稳定，不容易出现不收敛问题。
+    Design.md 原话：
+        ICA 去除眼动、肌电伪迹
+        ↓
+        基线校正，平均参考（CAR）
+        ↓
+        分段（4秒窗口，50%重叠，只取居中60%）
+        ↓
+        标准化（按通道 z-score）
     """
     if raw.ndim != 2 or raw.shape[0] != 62:
         raise ValueError(f"Expected (62, T), got {raw.shape}")
     x = raw.astype(np.float64, copy=False)
 
-    # 1) 基线校正
-    if cfg.get("use_baseline_correct", True):
-        x = baseline_correct(x, head_samples=None)
-
-    # 2) ICA（调整到 CAR 之前）
+    # 1) ICA（Design.md 第一步）
     if cfg.get("use_ica", False):
         x = apply_mne_ica_denoise(
             x,
@@ -234,7 +238,11 @@ def preprocess_trial(
             remove_k=int(cfg["ica_remove"]),
         )
 
-    # 3) CAR（移到 ICA 之后）
+    # 2) 基线校正（Design.md 第二步之一）
+    if cfg.get("use_baseline_correct", True):
+        x = baseline_correct(x, head_samples=None)
+
+    # 3) CAR（Design.md 第二步之二）
     if cfg.get("use_car", True):
         x = apply_car(x)
 
@@ -242,7 +250,7 @@ def preprocess_trial(
     middle_ratio = float(cfg.get("middle_ratio", 0.6))
     x_mid, cs, ce = center_crop(x, middle_ratio)
 
-    # 5) 滑动窗口
+    # 5) 滑动窗口（4秒，50%重叠）
     fs = int(cfg["fs"])
     win = int(round(float(cfg["window_seconds"]) * fs))
     step = int(round(float(cfg["step_seconds"]) * fs))
@@ -251,23 +259,17 @@ def preprocess_trial(
     windows = sliding_windows(x_mid, win=win, step=step)
 
     if not windows:
-        return (
-            np.zeros((0, 62, win), dtype=np.float32),
-            [],
-        )
+        return (np.zeros((0, 62, win), dtype=np.float32), [])
 
-    # ---- balance: at most `max_windows_per_trial`, take the most centered ones ----
+    # 均衡窗口数（Design.md：长视频主导问题，每 clip 至多 N 个居中窗口）
     max_n = int(cfg.get("max_windows_per_trial", 0) or 0)
     if max_n > 0 and len(windows) > max_n:
         mid = len(windows) / 2.0
-        ranked = sorted(
-            range(len(windows)),
-            key=lambda i: abs((i + 0.5) - mid),  # closer to center first
-        )
+        ranked = sorted(range(len(windows)), key=lambda i: abs((i + 0.5) - mid))
         keep_ids = sorted(ranked[:max_n])
         windows = [windows[i] for i in keep_ids]
 
-    # 6) z-score
+    # 6) 按通道 z-score（Design.md：标准化优先考虑按通道 z-score）
     use_pc = bool(cfg.get("per_channel_zscore", True))
     eps = float(cfg.get("eps", 1e-8))
     save_f32 = bool(cfg.get("save_float32", True))
@@ -279,15 +281,10 @@ def preprocess_trial(
         arr[i] = w.astype(arr.dtype, copy=False)
         metas.append(
             WindowMeta(
-                subject=subject,
-                session_id=session_id,
-                trial_id=trial_id,
-                label_idx=int(label_idx),
-                intensity=float(intensity),
-                crop_start=int(cs),
-                crop_end=int(ce),
-                window_start_in_crop=int(s),
-                window_end_in_crop=int(e),
+                subject=subject, session_id=session_id, trial_id=trial_id,
+                label_idx=int(label_idx), intensity=float(intensity),
+                crop_start=int(cs), crop_end=int(ce),
+                window_start_in_crop=int(s), window_end_in_crop=int(e),
             )
         )
     return arr, metas

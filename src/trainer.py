@@ -155,7 +155,7 @@ def evaluate(model, loader, criterion, device, use_amp):
         sb = sb.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, enabled=use_amp):
             logits, ps, _ = model(xb)
-            tl, parts = criterion(logits, ps, yb, sb)
+            _, parts = criterion(logits, ps, yb, sb)
         losses.append(parts["loss"]); cls_l.append(parts["cls"]); reg_l.append(parts["reg"])
         correct += (logits.argmax(1) == yb).sum().item()
         total += yb.numel()
@@ -277,14 +277,14 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # ================================================================
-    # STEP 1: 加载数据（全部加载到 RAM，OOM 时可换成 mmap 版本）
+    # STEP 1: 加载数据
     # ================================================================
     X_full, y_full, s_full, meta, splits_or_map = load_dataset_npz(str(cfg.data_path))
     n_total = len(y_full)
     logger.info(f"Data: X shape={X_full.shape}, N={n_total}")
 
     # ================================================================
-    # STEP 2: 确定 indices（被试筛选 或 使用预存划分）
+    # STEP 2: 确定 indices
     # ================================================================
     train_subj = _parse_subjects(cfg.train_subjects)
     val_subj = _parse_subjects(cfg.val_subjects)
@@ -349,7 +349,6 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     val_loader = make_loader(val_ds, cfg.batch_size, False, nw)
     test_loader = make_loader(test_ds, cfg.batch_size, False, nw) if test_ds else None
 
-    # Paths
     state_path = Path(cfg.resume_path) if cfg.resume_path else (cfg.output_dir / "train_state.pt")
     best_model_path = cfg.output_dir / "best_model.pt"
     best_encoder_path = cfg.output_dir / "best_encoder.pt"
@@ -364,7 +363,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     start_epoch = 1
     rse = cfg.pretrain_epochs + 1
     if cfg.resume and state_path.exists():
-        rs = torch.load(state_path, map_location="cpu")
+        rs = torch.load(state_path, map_location="cpu", weights_only=False)
         model.load_state_dict(rs["model"])
         optimizer.load_state_dict(rs["optimizer"])
         optimizer_to(optimizer, device)
@@ -434,7 +433,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         if epoch % cfg.save_interval == 0 or va["acc"] >= best_val_acc or dh:
             save_state(state_path, epoch, model, optimizer, scaler, best_val_acc, best_epoch,
                        bad_epochs, rse, train_idx, val_idx, test_idx, cfg)
-        if dh: logger.warning("[TIMEUP] @{}".format(epoch)); break
+        if dh: logger.warning(f"[TIMEUP] @{epoch}"); break
         if bad_epochs >= cfg.patience:
             logger.info(f"[EARLY-STOP] @{epoch}, best={best_val_acc:.4f} @{best_epoch}"); break
 
@@ -444,7 +443,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
 
     test_metrics = {}
     if best_model_path.exists() and test_loader:
-        ck = torch.load(best_model_path, map_location=device)
+        ck = torch.load(best_model_path, map_location=device, weights_only=False)
         model.load_state_dict(ck["model"]); del ck; gc.collect()
         test_metrics = evaluate(model, test_loader, build_loss(cfg, 0.0, False), device, use_amp)
         logger.info(f"[TEST] acc={test_metrics['acc']:.4f} mae={test_metrics['intensity_mae']:.4f}")

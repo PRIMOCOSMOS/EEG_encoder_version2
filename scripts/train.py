@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train (or resume) the SEED-VII dual-head model (EEGNet or EEGConformer)."""
+"""Train (or resume) the SEED-VII dual-head model."""
 from __future__ import annotations
 
 import argparse, os, sys
@@ -14,7 +14,7 @@ from src.trainer import TrainConfig, run_training
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train SEED-VII dual-head model")
-    p.add_argument("--data", type=str, required=True, help="Preprocessed .npz path")
+    p.add_argument("--data", type=str, required=True)
     p.add_argument("--output-dir", type=str, default=str(TRAIN_DEFAULTS["output_dir"]))
     p.add_argument("--seed", type=int, default=int(TRAIN_DEFAULTS["seed"]))
     p.add_argument("--batch-size", type=int, default=int(TRAIN_DEFAULTS["batch_size"]))
@@ -26,20 +26,18 @@ def parse_args():
     p.add_argument("--pretrain-epochs", type=int, default=int(TRAIN_DEFAULTS["pretrain_epochs"]))
     p.add_argument("--max-epochs", type=int, default=int(TRAIN_DEFAULTS["max_epochs"]))
     p.add_argument("--patience", type=int, default=int(TRAIN_DEFAULTS["patience"]))
-    # Loss
     p.add_argument("--alpha-cls", type=float, default=float(TRAIN_DEFAULTS["alpha_cls_start"]))
     p.add_argument("--beta-reg", type=float, default=float(TRAIN_DEFAULTS["beta_reg_start"]))
     p.add_argument("--gamma-rank-start", type=float, default=float(TRAIN_DEFAULTS["gamma_rank_start"]))
     p.add_argument("--gamma-rank-end", type=float, default=float(TRAIN_DEFAULTS["gamma_rank_end"]))
     p.add_argument("--rank-warmup-epochs", type=int, default=int(TRAIN_DEFAULTS["rank_warmup_epochs"]))
-    p.add_argument("--enable-rank", action="store_true", help="Turn on margin ranking loss")
+    p.add_argument("--enable-rank", action="store_true")
     p.add_argument("--rank-margin", type=float, default=float(TRAIN_DEFAULTS["rank_margin"]))
     p.add_argument("--label-smoothing", type=float, default=float(TRAIN_DEFAULTS["label_smoothing"]))
     p.add_argument("--sample-weight-mode", choices=["continuous", "threshold", "none"],
                    default=str(TRAIN_DEFAULTS["sample_weight_mode"]))
     p.add_argument("--intensity-threshold", type=float, default=float(TRAIN_DEFAULTS["intensity_threshold"]))
     p.add_argument("--weak-sample-weight", type=float, default=float(TRAIN_DEFAULTS["weak_sample_weight"]))
-    # Training
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], default=str(TRAIN_DEFAULTS["device"]))
     p.add_argument("--amp", action="store_true")
     p.add_argument("--no-amp", action="store_true")
@@ -50,15 +48,13 @@ def parse_args():
     p.add_argument("--save-features", action="store_true")
     p.add_argument("--feature-type", choices=["projected", "flatten"],
                    default=str(TRAIN_DEFAULTS["feature_type"]))
-    # Subject filter
-    p.add_argument("--train-subjects", type=str, default="", help="Comma-separated subject IDs")
+    p.add_argument("--train-subjects", type=str, default="")
     p.add_argument("--val-subjects", type=str, default="")
     p.add_argument("--test-subjects", type=str, default="")
     p.add_argument("--freeze-intensity-head", action="store_true")
-    # Model selection (核心参数)
     p.add_argument("--model-type", choices=["eegnet", "conformer"],
                    default=str(TRAIN_DEFAULTS.get("model_type", "eegnet")),
-                   help="Model architecture: 'eegnet' (轻量) or 'conformer' (Transformer)")
+                   help="模型架构: 'eegnet'（轻量）或 'conformer'（Transformer）")
     args = p.parse_args()
 
     amp = bool(TRAIN_DEFAULTS["amp"])

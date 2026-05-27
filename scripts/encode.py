@@ -11,10 +11,10 @@ from src.inference import encode_npz
 
 
 def main():
-    p = argparse.ArgumentParser(description="Encode SEED-VII windows with trained model")
-    p.add_argument("--data", required=True, help="Preprocessed .npz path")
-    p.add_argument("--checkpoint", required=True, help="best_encoder.pt or best_model.pt")
-    p.add_argument("--output", required=True, help="Output .npz path")
+    p = argparse.ArgumentParser(description="Encode SEED-VII windows")
+    p.add_argument("--data", required=True)
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--output", required=True)
     p.add_argument("--model-type", choices=["eegnet", "conformer"], default="eegnet")
     p.add_argument("--feature-type", choices=["projected", "flatten"], default="projected")
     p.add_argument("--batch-size", type=int, default=256)
