@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import tempfile
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -74,7 +75,6 @@ def scan_npz_metadata(
                              np.arange(n, dtype=np.int64)])
         )
         print(f"[SCAN] {p.name}: {n} windows (y/s/meta only, X skipped)")
-        # 显式关闭 npz 避免 fd 泄漏
         del data, y, s, meta_raw
         gc.collect()
 
@@ -97,21 +97,17 @@ class MmapXStore:
 
     对每个 npz 文件，将其中的 X 数组解压为一个独立的 .npy 文件（放在 cache_dir），
     然后用 np.memmap 打开。内存占用 ≈ 0（由 OS 页面缓存管理）。
-
-    磁盘开销 = 原始 X 数据的 uncompressed 大小（float32）。
-    对 20 × 3660 × 62 × 800 × 4B ≈ 13.6 GB，但这是顺序写、随机读，
-    比全量 RAM 安全得多。
     """
 
     def __init__(self, npz_paths: List[Path], cache_dir: Optional[str] = None):
         if cache_dir:
             self._cache_dir = Path(cache_dir)
             self._cache_dir.mkdir(parents=True, exist_ok=True)
-            self._owned = False      # 用户管理生命周期
+            self._owned = False
         else:
             self._tmp = tempfile.mkdtemp(prefix="eeg_mmap_")
             self._cache_dir = Path(self._tmp)
-            self._owned = True       # 我们自己清理
+            self._owned = True
 
         self._mmaps: List[np.memmap] = []
         self._counts: List[int] = []
@@ -120,10 +116,8 @@ class MmapXStore:
             npy_path = self._cache_dir / f"{p.stem}_X.npy"
 
             if npy_path.exists():
-                # 已经解压过，直接 memmap
                 mm = np.load(str(npy_path), mmap_mode="r")
             else:
-                # 从 npz 解压 X 并保存为独立 .npy
                 data = np.load(p, allow_pickle=True)
                 X = data["X"]
                 np.save(str(npy_path), X.astype(np.float32))
@@ -142,8 +136,9 @@ class MmapXStore:
               f"total .npy disk = {total_npy / 1024**3:.2f} GB")
 
     def get(self, file_idx: int, local_idx: int) -> np.ndarray:
-        """Read one window: returns (62, 800) float32 (zero-copy from mmap)."""
-        return self._mmaps[file_idx][local_idx]
+        """Read one window: returns a WRITABLE (62, 800) float32 copy."""
+        # .copy() 确保：1) 可写  2) contiguous  3) 脱离 memmap 页锁定
+        return self._mmaps[file_idx][local_idx].copy()
 
     def close(self):
         for mm in self._mmaps:
@@ -168,7 +163,7 @@ class EEGMmapDataset(Dataset):
     """Zero-RAM dataset backed by memory-mapped .npy files.
 
     每次 __getitem__ 从 memmap 读一条 (62, 800) 切片，
-    OS 页面缓存自动管理，不会 OOM。
+    .copy() 产生可写副本后转 Tensor，不会触发 PyTorch non-writable 警告。
     """
 
     def __init__(
@@ -191,8 +186,9 @@ class EEGMmapDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         i = self.indices[idx]
         fi, li = int(self.file_map[i, 0]), int(self.file_map[i, 1])
-        x = self.x_store.get(fi, li)                         # (62, 800) float32
-        x_t = torch.from_numpy(np.ascontiguousarray(x)).unsqueeze(0)  # (1, 62, 800)
+        # x_store.get() 已经返回 .copy()，可写 + contiguous
+        x = self.x_store.get(fi, li)                          # (62, 800) float32, writable
+        x_t = torch.from_numpy(x).unsqueeze(0)                # (1, 62, 800)
         return x_t, torch.tensor(self.y[i], dtype=torch.long), \
                torch.tensor(self.s[i], dtype=torch.float32)
 
