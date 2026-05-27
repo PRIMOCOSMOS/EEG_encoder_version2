@@ -33,7 +33,6 @@ FOLDS_PER_SESSION = 4
 TRIALS_PER_FOLD = 5
 TRIALS_PER_SESSION = FOLDS_PER_SESSION * TRIALS_PER_FOLD  # 20
 
-
 def trial_id_to_emotion(session_id: int, trial_id_1based: int) -> str:
     """trial_id ∈ [1, 20] for a single session, in playback order."""
     if not (1 <= trial_id_1based <= TRIALS_PER_SESSION):
@@ -42,7 +41,6 @@ def trial_id_to_emotion(session_id: int, trial_id_1based: int) -> str:
     in_fold_idx = (trial_id_1based - 1) % TRIALS_PER_FOLD
     return SESSION_SEQUENCES[session_id][fold_idx][in_fold_idx]
 
-
 def trial_field_to_session_trial(field_id_1based: int) -> Tuple[int, int]:
     """Map .mat field name 1..80 -> (session 1-4, trial 1-20)."""
     if not (1 <= field_id_1based <= 80):
@@ -50,7 +48,6 @@ def trial_field_to_session_trial(field_id_1based: int) -> Tuple[int, int]:
     session_id = (field_id_1based - 1) // TRIALS_PER_SESSION + 1
     trial_in_session = (field_id_1based - 1) % TRIALS_PER_SESSION + 1
     return session_id, trial_in_session
-
 
 def field_id_to_label(field_id_1based: int) -> Tuple[int, str, int]:
     """Convenience: 1..80 -> (session_id, emotion_code, class_idx)."""

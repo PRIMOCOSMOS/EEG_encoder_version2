@@ -1,10 +1,10 @@
-"""SEED-VII dataset utilities.
+"""SEED-VII dataset utilities — 重构版.
 
-提供：
-  - load_dataset_npz / load_dataset_mmap：加载预处理后的 npz
-  - EEGWindowArrayDataset：窗口 Dataset
-  - filter_by_subjects：按被试筛选索引
-  - split_trials：trial-level 划分
+核心变化：
+- 预处理输出为 per-subject .npz 文件 (共 20 个)
+- 训练时可按需加载单/多个被试的 npz
+- 支持 trial-level 划分以避免数据泄漏
+- 支持从本地 .mat 目录或 ModelScope 远端读取原始数据
 """
 from __future__ import annotations
 import json
@@ -16,44 +16,68 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .labels import EMOTION_TO_IDX, trial_field_to_session_trial
+from .labels import EMOTION_TO_IDX, trial_field_to_session_trial, trial_id_to_emotion
 
 
 # --------------------------------------------------------------------------
-# 数据加载
+# 数据加载 (per-subject npz)
 # --------------------------------------------------------------------------
 
-def load_dataset_npz(npz_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list, dict]:
-    """Load preprocessed npz file. Returns (X, y, s, meta, splits)."""
-    data = np.load(npz_path, allow_pickle=True)
-    X = data["X"]                     # (N, 62, 800) float32
-    y = data["y"]                     # (N,) int64
-    s = data["s"]                     # (N,) float32
-    meta = [json.loads(m) for m in data["meta"]]
-    splits = {}
-    for key in ("train", "val", "test"):
-        if f"split_{key}" in data:
-            splits[key] = data[f"split_{key}"]
-    return X, y, s, meta, splits
+def load_subject_npz(npz_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+    """Load a single subject's preprocessed npz.
 
-
-def load_dataset_mmap(npz_path: str) -> Tuple[np.memmap, np.ndarray, np.ndarray, list, dict]:
-    """Load preprocessed npz with X as memmap (zero RAM)."""
+    Returns (X, y, s, meta) where:
+      X: (N, 62, 800) float32
+      y: (N,) int64
+      s: (N,) float32
+      meta: list of dicts
+    """
     data = np.load(npz_path, allow_pickle=True)
-    # Re-open X as memmap for zero-RAM access
-    X = np.memmap(npz_path, mode="r", dtype=np.float32,
-                  shape=(data["X"].shape[0], data["X"].shape[1], data["X"].shape[2]),
-                  offset=data["X"].file.tell() if hasattr(data["X"], "file") else 0)
-    # Fallback: just use the array (npz already loaded)
     X = data["X"]
     y = data["y"]
     s = data["s"]
     meta = [json.loads(m) for m in data["meta"]]
-    splits = {}
-    for key in ("train", "val", "test"):
-        if f"split_{key}" in data:
-            splits[key] = data[f"split_{key}"]
-    return X, y, s, meta, splits
+    return X, y, s, meta
+
+
+def load_multi_subject_npz(
+    npz_dir: str,
+    subjects: Optional[List[str]] = None,
+    pattern: str = "*.npz",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+    """Load and concatenate multiple subject npz files from a directory.
+
+    If subjects is None, loads all .npz files found.
+    Returns (X_all, y_all, s_all, meta_all).
+    """
+    d = Path(npz_dir)
+    if subjects:
+        paths = []
+        for s in subjects:
+            p = d / f"{s}.npz"
+            if p.exists():
+                paths.append(p)
+            else:
+                print(f"[WARN] Subject npz not found: {p}")
+    else:
+        paths = sorted(d.glob(pattern))
+
+    if not paths:
+        raise FileNotFoundError(f"No npz files found in {npz_dir}")
+
+    X_list, y_list, s_list, meta_all = [], [], [], []
+    for p in paths:
+        X, y, s, meta = load_subject_npz(str(p))
+        X_list.append(X)
+        y_list.append(y)
+        s_list.append(s)
+        meta_all.extend(meta)
+        print(f"[LOAD] {p.name}: {X.shape[0]} windows")
+
+    return (np.concatenate(X_list, axis=0),
+            np.concatenate(y_list, axis=0),
+            np.concatenate(s_list, axis=0),
+            meta_all)
 
 
 # --------------------------------------------------------------------------
@@ -75,20 +99,13 @@ class EEGWindowArrayDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         i = self.indices[idx]
-        x = self.X[i].unsqueeze(0)          # (1, 62, 800)
+        x = self.X[i].unsqueeze(0)  # (1, 62, 800)
         return x, self.y[i], self.s[i]
 
 
 # --------------------------------------------------------------------------
-# 辅助函数
+# Trial-level split
 # --------------------------------------------------------------------------
-
-def filter_by_subjects(meta: list, subjects: List[str]) -> np.ndarray:
-    """Return indices of windows whose subject is in the given list."""
-    subjects_set = set(str(s) for s in subjects)
-    return np.array([i for i, m in enumerate(meta)
-                     if str(m.get("subject", "")) in subjects_set], dtype=np.int64)
-
 
 @dataclass
 class TrialKey:
@@ -100,21 +117,150 @@ class TrialKey:
         return (self.subject, self.session_id, self.trial_id)
 
 
-def split_trials(trial_keys: List[TrialKey], trial_labels: List[int],
-                 val_ratio: float = 0.1, test_ratio: float = 0.1,
-                 seed: int = 42, unit: str = "trial") -> Tuple[List, List, List]:
-    """Split trial-level indices into train/val/test (by trial unit)."""
-    rng = np.random.default_rng(seed)
+def split_trials_from_meta(
+    meta: list,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    seed: int = 42,
+) -> Dict[str, np.ndarray]:
+    """Split window indices by trial membership to avoid data leakage.
+
+    Design.md 原则：先切分 trial 列表，再在各自集合内独立做窗口化和归一化。
+    由于预处理已在 per-subject 级别完成（z-score 独立），这里只需按 trial 分割索引。
+
+    Returns dict with keys 'train', 'val', 'test' -> np.ndarray of window indices.
+    """
+    # Extract unique trial keys and their window indices
+    trial_to_windows: Dict[Tuple[str, int, int], List[int]] = {}
+    for i, m in enumerate(meta):
+        key = (str(m["subject"]), int(m["session_id"]), int(m["trial_id"]))
+        if key not in trial_to_windows:
+            trial_to_windows[key] = []
+        trial_to_windows[key].append(i)
+
+    trial_keys = list(trial_to_windows.keys())
     n = len(trial_keys)
+
+    rng = np.random.default_rng(seed)
     indices = np.arange(n)
     rng.shuffle(indices)
+
     n_test = max(1, int(round(n * test_ratio)))
     n_val = max(1, int(round(n * val_ratio)))
-    test_idx = indices[:n_test]
-    val_idx = indices[n_test:n_test + n_val]
-    train_idx = indices[n_test + n_val:]
-    return (
-        [trial_keys[i] for i in train_idx],
-        [trial_keys[i] for i in val_idx],
-        [trial_keys[i] for i in test_idx],
-    )
+
+    test_trial_idx = indices[:n_test]
+    val_trial_idx = indices[n_test:n_test + n_val]
+    train_trial_idx = indices[n_test + n_val:]
+
+    result: Dict[str, List[int]] = {"train": [], "val": [], "test": []}
+    for split_name, trial_idx_arr in [("test", test_trial_idx),
+                                       ("val", val_trial_idx),
+                                       ("train", train_trial_idx)]:
+        for ti in trial_idx_arr:
+            tk = trial_keys[ti]
+            result[split_name].extend(trial_to_windows[tk])
+
+    return {k: np.array(sorted(v), dtype=np.int64) for k, v in result.items()}
+
+
+def filter_by_subjects(meta: list, subjects: List[str]) -> np.ndarray:
+    """Return indices of windows whose subject is in the given list."""
+    subjects_set = set(str(s) for s in subjects)
+    return np.array([i for i, m in enumerate(meta)
+                     if str(m.get("subject", "")) in subjects_set], dtype=np.int64)
+
+
+# --------------------------------------------------------------------------
+# .mat 文件读取工具
+# --------------------------------------------------------------------------
+
+@dataclass
+class TrialData:
+    subject: str
+    session_id: int
+    trial_id: int
+    field_id: int
+    eeg: np.ndarray             # (62, T)
+    emotion_code: str
+    label_idx: int
+
+
+def iter_trials_from_mat(mat_path: str) -> Iterator[TrialData]:
+    """Iterate over all trials in a single .mat file.
+
+    Supports both MAT v7.3 (HDF5) and older formats.
+    """
+    subject = Path(mat_path).stem
+    field_ids = []
+
+    # Try HDF5 first
+    try:
+        import h5py
+        with h5py.File(mat_path, "r") as f:
+            for k in f.keys():
+                if k.startswith("#"):
+                    continue
+                if k.isdigit():
+                    field_ids.append(int(k))
+        field_ids.sort()
+        for fid in field_ids:
+            with h5py.File(mat_path, "r") as f:
+                eeg = np.array(f[str(fid)], dtype=np.float64)
+                if eeg.ndim == 2 and eeg.shape[0] != 62 and eeg.shape[1] == 62:
+                    eeg = eeg.T
+            sid, tid = trial_field_to_session_trial(fid)
+            code = trial_id_to_emotion(sid, tid)
+            yield TrialData(
+                subject=subject, session_id=sid, trial_id=tid,
+                field_id=fid, eeg=eeg,
+                emotion_code=code, label_idx=EMOTION_TO_IDX[code])
+        return
+    except Exception:
+        pass
+
+    # Fallback: scipy
+    import scipy.io as sio
+    mat = sio.loadmat(mat_path)
+    for k in mat.keys():
+        if k.startswith("_"):
+            continue
+        if k.isdigit():
+            field_ids.append(int(k))
+    field_ids.sort()
+    for fid in field_ids:
+        eeg = np.array(mat[str(fid)], dtype=np.float64)
+        if eeg.ndim == 2 and eeg.shape[0] != 62 and eeg.shape[1] == 62:
+            eeg = eeg.T
+        sid, tid = trial_field_to_session_trial(fid)
+        code = trial_id_to_emotion(sid, tid)
+        yield TrialData(
+            subject=subject, session_id=sid, trial_id=tid,
+            field_id=fid, eeg=eeg,
+            emotion_code=code, label_idx=EMOTION_TO_IDX[code])
+
+
+def load_save_info_intensity(save_info_dir: str) -> Dict[Tuple[str, int, int], float]:
+    """Load continuous intensity labels from save_info CSV files.
+
+    Returns {(subject, session_id, trial_id): mean_intensity}.
+    """
+    import csv
+    d = Path(save_info_dir)
+    result: Dict[Tuple[str, int, int], float] = {}
+
+    for csv_path in sorted(d.rglob("*_save_info.csv")):
+        subject = csv_path.stem.replace("_save_info", "")
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    fid = int(row.get("trial_id", row.get("field_id", 0)))
+                    if fid <= 0:
+                        continue
+                    intensity = float(row.get("intensity", row.get("mean_intensity", 0.5)))
+                    sid, tid = trial_field_to_session_trial(fid)
+                    result[(subject, sid, tid)] = np.clip(intensity, 0.0, 1.0)
+        except Exception as e:
+            print(f"[WARN] Failed to read {csv_path}: {e}")
+
+    return result

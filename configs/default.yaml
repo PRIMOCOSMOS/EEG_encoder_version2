@@ -1,4 +1,5 @@
-# Optional YAML overrides for non-CLI users (not auto-loaded; just a reference).
+# Default configuration for SEED-VII EEGNet Encoder (refactored, no ICA)
+
 preprocess:
   fs: 200
   window_seconds: 4.0
@@ -7,22 +8,23 @@ preprocess:
   max_windows_per_trial: 60
   per_channel_zscore: true
   use_car: true
-  use_ica: false
+  use_ica: false              # ICA 已关闭，不在主 Pipeline 中使用
 
 model:
+  # EEGNet (主力模型)
+  type: eegnet
   n_channels: 62
   n_timepoints: 800
   n_classes: 7
-  embed_dim: 40
-  transformer_layers: 6
-  transformer_heads: 10
-  ffn_dim: 160
-  head_hidden: 256
+  F1: 8
+  D: 2
+  F2: 16
+  kernLength: 100
   dropout: 0.5
   intensity_head_hidden: 64
 
 train:
-  batch_size: 64
+  batch_size: 256
   lr: 2.0e-4
   min_lr: 1.0e-5
   pretrain_epochs: 10
@@ -30,10 +32,10 @@ train:
   patience: 30
   alpha_cls: 1.0
   beta_reg: 0.5
-  gamma_rank_start: 0.3
+  gamma_rank_start: 0.0
   gamma_rank_end: 0.8
   rank_warmup_epochs: 30
-  enable_rank: false  # 退化方案：先不开
+  enable_rank: false          # 退化方案：先不开排序损失
   rank_margin: 0.05
   label_smoothing: 0.05
   sample_weight_mode: continuous
@@ -43,9 +45,14 @@ train:
   test_ratio: 0.1
   split_unit: trial
   max_runtime_hours: 10.0
+  model_type: eegnet
 
-  # ---- 过拟合缓解 ----
-  freeze_intensity_head: false   # 冻结强度回归头，只训练分类
-  train_subjects: ""             # 逗号分隔，如 "1,2,3"（空=全部）
-  val_subjects: ""               # 逗号分隔，如 "10,11"（跨被试验证）
-  test_subjects: ""              # 逗号分隔，如 "19,20"
+  # 过拟合缓解
+  freeze_intensity_head: false
+  train_subjects: ""
+  val_subjects: ""
+  test_subjects: ""
+
+modelscope:
+  dataset_id: DEREKVERSE/SEED-VII
+  npz_prefix: preprocessed_npz

@@ -1,4 +1,11 @@
-"""Central configuration for SEED-VII preprocessing, model, and training."""
+"""Central configuration for SEED-VII preprocessing, model, and training.
+
+重构原则 (2026-05-27):
+- 模型重点转向 EEGNet，Conformer 保留但非默认
+- ICA 默认关闭且不在主 Pipeline 中使用
+- 预处理输出为 per-subject .npz (20 个文件)，回写到 ModelScope 数据集
+- 训练从 .npz 文件加载
+"""
 from __future__ import annotations
 from typing import Dict
 
@@ -6,38 +13,38 @@ from typing import Dict
 # Preprocessing
 # --------------------------------------------------------------------------
 PREPROCESS_DEFAULTS: Dict[str, object] = {
-    "fs": 200,                    # SEED-VII EEG_preprocessed 已 200Hz
-    "window_seconds": 4.0,        # 4 秒窗口
-    "step_seconds": 2.0,          # 50% 重叠
-    "middle_ratio": 0.6,          # 每个 trial 取居中 60%
-    "max_windows_per_trial": 60,  # 防长视频主导：每 clip 至多 N 个窗口
-    "use_car": True,              # 平均参考
-    "use_baseline_correct": True, # 基线去均值
-    "use_ica": False,             # ICA（默认关闭，耗时）
+    "fs": 200,                      # SEED-VII EEG_preprocessed 已 200Hz
+    "window_seconds": 4.0,          # 4 秒窗口
+    "step_seconds": 2.0,            # 50% 重叠
+    "middle_ratio": 0.6,            # 每个 trial 取居中 60%
+    "max_windows_per_trial": 60,    # 防长视频主导：每 clip 至多 N 个窗口
+    "use_car": True,                # 平均参考
+    "use_baseline_correct": True,   # 基线去均值
+    "use_ica": False,               # ICA — 关闭，不在主 Pipeline 中使用
     "ica_components": 20,
     "ica_remove": 5,
-    "per_channel_zscore": True,   # 按通道 z-score（优先方案）
+    "per_channel_zscore": True,     # 按通道 z-score（优先方案）
     "eps": 1e-8,
     "save_float32": True,
 }
 
 # --------------------------------------------------------------------------
-# EEGNet 模型配置（轻量，≈5K 参数，适合小样本 / 跨被试）
+# EEGNet 模型配置（主力模型）
 # --------------------------------------------------------------------------
 EEGNET_CONFIG: Dict[str, object] = {
     "n_channels": 62,
-    "n_timepoints": 800,          # 4s * 200Hz
-    "n_classes": 7,               # SEED-VII 7 类情绪
-    "F1": 8,                      # 时间滤波器数量
-    "D": 2,                       # 深度乘子
-    "F2": 16,                     # 通常 F2 = F1 * D
-    "kernLength": 100,            # 200Hz raw EEG，0.5秒感受野
-    "dropout": 0.5,               # 跨被试建议 0.5；被试内可 0.25
+    "n_timepoints": 800,            # 4s * 200Hz
+    "n_classes": 7,                 # SEED-VII 7 类情绪
+    "F1": 8,                        # 时间滤波器数量
+    "D": 2,                         # 深度乘子
+    "F2": 16,                       # 通常 F2 = F1 * D
+    "kernLength": 100,              # 200Hz raw EEG，0.5秒感受野
+    "dropout": 0.5,                 # 跨被试建议 0.5；被试内可 0.25
     "intensity_head_hidden": 64,
 }
 
 # --------------------------------------------------------------------------
-# EEGConformer 配置（≈0.75M 参数，全 Transformer 编码器）
+# EEGConformer 配置（保留备用，≈0.75M 参数）
 # --------------------------------------------------------------------------
 CONFORMER_CONFIG: Dict[str, object] = {
     "n_channels": 62,
@@ -113,8 +120,8 @@ TRAIN_DEFAULTS: Dict[str, object] = {
     # DataLoader
     "pin_memory": False,
     "persistent_workers": False,
-    # 模型选择
-    "model_type": "eegnet",  # ["eegnet", "conformer"]
+    # 模型选择 — 默认 EEGNet
+    "model_type": "eegnet",         # ["eegnet", "conformer"]
     # 被试筛选
     "train_subjects": "",
     "val_subjects": "",
@@ -122,3 +129,9 @@ TRAIN_DEFAULTS: Dict[str, object] = {
     # 过拟合缓解
     "freeze_intensity_head": False,
 }
+
+# --------------------------------------------------------------------------
+# ModelScope 数据集
+# --------------------------------------------------------------------------
+MODELSCOPE_DATASET_ID = "DEREKVERSE/SEED-VII"
+NPZ_REPO_PREFIX = "preprocessed_npz"       # npz 文件在 dataset repo 中的路径前缀

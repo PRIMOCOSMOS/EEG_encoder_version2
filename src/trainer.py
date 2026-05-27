@@ -1,20 +1,17 @@
 """Training loop for SEED-VII dual-head model (EEGNet or EEGConformer).
 
-支持：
-  --model-type eegnet    → EEGNetDualHead   （轻量，≈5K 参数）
-  --model-type conformer → EEGConformerDualHead（≈0.75M 参数）
-
-OOM 策略：
-  - mmap 加载 X（零 RAM）
-  - 只加载需要的被试子集到 RAM
-  - 单被试约 600MB vs 全量约 12GB
+重构版：
+- 从 per-subject .npz 目录加载数据
+- Trial-level 划分避免数据泄漏
+- 支持被试筛选（跨被试/被试内训练）
+- 断点续训 / 软超时 / 周期保存
 """
 from __future__ import annotations
 
 import gc, json, logging, math, os, random, time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -22,17 +19,19 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from .config import CONFORMER_CONFIG, EEGNET_CONFIG, TRAIN_DEFAULTS
-from .dataset import EEGWindowArrayDataset, filter_by_subjects, load_dataset_npz
+from .dataset import (
+    EEGWindowArrayDataset,
+    filter_by_subjects,
+    load_multi_subject_npz,
+    split_trials_from_meta,
+)
 from .losses import LossConfig, WeightedDualLoss
 from .model import build_model, count_parameters, freeze_intensity_head
 
-# --------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------
 
 @dataclass
 class TrainConfig:
-    data_path: Path
+    data_dir: Path              # 存放 per-subject .npz 文件的目录
     output_dir: Path
     seed: int = int(TRAIN_DEFAULTS["seed"])
     batch_size: int = int(TRAIN_DEFAULTS["batch_size"])
@@ -66,13 +65,15 @@ class TrainConfig:
     resume_path: str = ""
     save_interval: int = int(TRAIN_DEFAULTS["save_interval"])
     max_runtime_hours: float = float(TRAIN_DEFAULTS["max_runtime_hours"])
-    pin_memory: bool = bool(TRAIN_DEFAULTS.get("pin_memory", False))
-    persistent_workers: bool = bool(TRAIN_DEFAULTS.get("persistent_workers", False))
-    freeze_intensity_head: bool = bool(TRAIN_DEFAULTS.get("freeze_intensity_head", False))
-    train_subjects: str = str(TRAIN_DEFAULTS.get("train_subjects", ""))
-    val_subjects: str = str(TRAIN_DEFAULTS.get("val_subjects", ""))
-    test_subjects: str = str(TRAIN_DEFAULTS.get("test_subjects", ""))
-    model_type: str = str(TRAIN_DEFAULTS.get("model_type", "eegnet"))
+    pin_memory: bool = False
+    persistent_workers: bool = False
+    freeze_intensity_head: bool = False
+    train_subjects: str = ""
+    val_subjects: str = ""
+    test_subjects: str = ""
+    model_type: str = str(TRAIN_DEFAULTS["model_type"])
+    val_ratio: float = float(TRAIN_DEFAULTS["val_ratio"])
+    test_ratio: float = float(TRAIN_DEFAULTS["test_ratio"])
 
 
 # --------------------------------------------------------------------------
@@ -86,19 +87,19 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
 def resolve_device(d: str):
-    if d == "auto": return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if d == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if d == "cuda" and not torch.cuda.is_available():
-        print("[WARN] No CUDA, fallback CPU."); return torch.device("cpu")
+        print("[WARN] No CUDA, fallback CPU.")
+        return torch.device("cpu")
     return torch.device(d)
-
 
 def optimizer_to(opt, device):
     for st in opt.state.values():
         for k, v in st.items():
-            if torch.is_tensor(v): st[k] = v.to(device)
-
+            if torch.is_tensor(v):
+                st[k] = v.to(device)
 
 def setup_logger(od: Path):
     od.mkdir(parents=True, exist_ok=True)
@@ -113,18 +114,18 @@ def setup_logger(od: Path):
     lg.addHandler(fh); lg.addHandler(sh)
     return lg
 
-
 def cosine_lr(ep, tot, base, mn):
-    if tot <= 1: return base
+    if tot <= 1:
+        return base
     return mn + (base - mn) * 0.5 * (1 + math.cos(math.pi * ep / max(1, tot - 1)))
 
-
 def gamma_schedule(ep, cfg, started):
-    if not cfg.enable_rank: return 0.0
-    if cfg.rank_warmup_epochs <= 0: return cfg.gamma_rank_end
+    if not cfg.enable_rank:
+        return 0.0
+    if cfg.rank_warmup_epochs <= 0:
+        return cfg.gamma_rank_end
     p = min(1.0, max(0.0, max(0, ep - started) / float(cfg.rank_warmup_epochs)))
     return cfg.gamma_rank_start + (cfg.gamma_rank_end - cfg.gamma_rank_start) * p
-
 
 def _parse_subjects(s: str) -> List[str]:
     return [p.strip() for p in s.split(",") if p.strip()]
@@ -139,9 +140,9 @@ def build_loss(cfg, gamma, enable_rank):
         alpha=cfg.alpha_cls, beta=cfg.beta_reg, gamma=gamma,
         label_smoothing=cfg.label_smoothing, rank_margin=cfg.rank_margin,
         enable_rank=enable_rank, sample_weight_mode=cfg.sample_weight_mode,
-        intensity_threshold=cfg.intensity_threshold, weak_sample_weight=cfg.weak_sample_weight,
+        intensity_threshold=cfg.intensity_threshold,
+        weak_sample_weight=cfg.weak_sample_weight,
     ))
-
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device, use_amp):
@@ -165,9 +166,9 @@ def evaluate(model, loader, criterion, device, use_amp):
         "loss": float(np.mean(losses)) if losses else float("nan"),
         "cls": float(np.mean(cls_l)) if cls_l else float("nan"),
         "reg": float(np.mean(reg_l)) if reg_l else float("nan"),
-        "acc": correct / n, "intensity_mae": abs_err / n,
+        "acc": correct / n,
+        "intensity_mae": abs_err / n,
     }
-
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_amp,
                     grad_clip, deadline_ts=None):
@@ -196,7 +197,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_amp
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-        losses.append(parts["loss"]); cls_l.append(parts["cls"]); reg_l.append(parts["reg"]); rank_l.append(parts["rank"])
+        losses.append(parts["loss"]); cls_l.append(parts["cls"])
+        reg_l.append(parts["reg"]); rank_l.append(parts["rank"])
         correct += (logits.argmax(1) == yb).sum().item()
         total += yb.numel()
     n = max(1, total)
@@ -220,17 +222,18 @@ def save_state(path, epoch, model, optimizer, scaler, bv, be, bad, rse, ti, vi, 
         "best_val_acc": float(bv), "best_epoch": int(be), "bad_epochs": int(bad),
         "rank_started_at_epoch": int(rse),
         "train_idx": ti, "val_idx": vi, "test_idx": tsi,
-        "config": asdict(cfg) | {"data_path": str(cfg.data_path), "output_dir": str(cfg.output_dir)},
+        "config": asdict(cfg) | {
+            "data_dir": str(cfg.data_dir), "output_dir": str(cfg.output_dir)
+        },
     }, path)
-
 
 def save_encoder(path, model, config_dict):
     torch.save({"model": model.state_dict(), "config": config_dict}, path)
 
-
 def make_loader(ds, bs, shuffle, nw, pin=False, pw=False):
     return DataLoader(ds, batch_size=bs, shuffle=shuffle, num_workers=nw,
-                      pin_memory=pin, persistent_workers=pw if nw > 0 else False, drop_last=False)
+                      pin_memory=pin, persistent_workers=pw if nw > 0 else False,
+                      drop_last=False)
 
 
 # --------------------------------------------------------------------------
@@ -246,21 +249,19 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     use_amp = bool(cfg.amp and device.type == "cuda")
 
     # ================================================================
-    # STEP 0: 构建模型（根据 --model-type 选择架构）
+    # STEP 0: 构建模型
     # ================================================================
     if cfg.model_type == "eegnet":
         model = build_model("eegnet", EEGNET_CONFIG)
         active_config = EEGNET_CONFIG
         logger.info(f"[MODEL] EEGNet (F1={EEGNET_CONFIG['F1']}, D={EEGNET_CONFIG['D']}, "
-                    f"F2={EEGNET_CONFIG['F2']}, kernLength={EEGNET_CONFIG['kernLength']})")
+                     f"kernLength={EEGNET_CONFIG['kernLength']})")
     elif cfg.model_type == "conformer":
         model = build_model("conformer", CONFORMER_CONFIG)
         active_config = CONFORMER_CONFIG
-        logger.info(f"[MODEL] EEGConformer (embed={CONFORMER_CONFIG['embed_dim']}, "
-                    f"layers={CONFORMER_CONFIG['transformer_layers']}, "
-                    f"heads={CONFORMER_CONFIG['transformer_heads']})")
+        logger.info(f"[MODEL] EEGConformer (embed={CONFORMER_CONFIG['embed_dim']})")
     else:
-        raise ValueError(f"--model-type must be 'eegnet' or 'conformer', got: {cfg.model_type}")
+        raise ValueError(f"Unknown model_type: {cfg.model_type}")
 
     model = model.to(device)
 
@@ -270,42 +271,52 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         logger.info(f"[FREEZE] {nf:,} frozen, {n_params:,} trainable")
     else:
         n_params = count_parameters(model)
-        logger.info(f"[MODEL] Params={n_params:,} ({n_params/1e6:.4f}M)")
+    logger.info(f"[MODEL] Params={n_params:,} ({n_params/1e6:.4f}M)")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr,
-                                 betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
+                                 betas=(cfg.beta1, cfg.beta2),
+                                 weight_decay=cfg.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # ================================================================
-    # STEP 1: 加载数据
+    # STEP 1: 加载数据（per-subject npz 目录）
     # ================================================================
-    X_full, y_full, s_full, meta, splits_or_map = load_dataset_npz(str(cfg.data_path))
+    train_subj = _parse_subjects(cfg.train_subjects)
+    val_subj = _parse_subjects(cfg.val_subjects)
+    test_subj = _parse_subjects(cfg.test_subjects)
+
+    # 确定加载哪些被试
+    all_subjects = None
+    if train_subj or val_subj or test_subj:
+        all_subjects = list(set(train_subj + val_subj + test_subj))
+    X_full, y_full, s_full, meta = load_multi_subject_npz(
+        str(cfg.data_dir), subjects=all_subjects)
     n_total = len(y_full)
     logger.info(f"Data: X shape={X_full.shape}, N={n_total}")
 
     # ================================================================
     # STEP 2: 确定 indices
     # ================================================================
-    train_subj = _parse_subjects(cfg.train_subjects)
-    val_subj = _parse_subjects(cfg.val_subjects)
-    test_subj = _parse_subjects(cfg.test_subjects)
     use_subj_filter = bool(train_subj or val_subj or test_subj)
 
     if use_subj_filter:
-        all_subj = sorted(set(str(m.get("subject", "")) for m in meta))
+        # 按被试划分
+        all_subj_in_data = sorted(set(str(m.get("subject", "")) for m in meta))
         if train_subj:
             train_idx = filter_by_subjects(meta, train_subj)
         else:
             excl = set(val_subj) | set(test_subj)
-            train_idx = filter_by_subjects(meta, [s for s in all_subj if s not in excl]) \
-                if (val_subj or test_subj) else np.arange(n_total, dtype=np.int64)
+            train_idx = filter_by_subjects(
+                meta, [s for s in all_subj_in_data if s not in excl])
+
         if val_subj:
             val_idx = filter_by_subjects(meta, val_subj)
         else:
             rng = np.random.default_rng(cfg.seed)
             pool = np.setdiff1d(np.arange(n_total), train_idx)
-            n_val = max(1, int(round(len(pool) * 0.1)))
+            n_val = max(1, int(round(len(pool) * cfg.val_ratio)))
             val_idx = np.sort(rng.choice(pool, size=min(n_val, len(pool)), replace=False))
+
         if test_subj:
             test_idx = filter_by_subjects(meta, test_subj)
         else:
@@ -319,30 +330,28 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 test_idx = np.array([], dtype=np.int64)
         logger.info(f"[SUBJECT-FILTER] train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
     else:
-        if {"train", "val", "test"} <= set(splits_or_map.keys()):
-            train_idx = splits_or_map["train"]
-            val_idx = splits_or_map["val"]
-            test_idx = splits_or_map["test"]
-        else:
-            rng = np.random.default_rng(cfg.seed)
-            idx = np.arange(n_total)
-            rng.shuffle(idx)
-            n_test = int(round(n_total * 0.1))
-            n_val = int(round(n_total * 0.1))
-            test_idx = idx[:n_test]
-            val_idx = idx[n_test:n_test + n_val]
-            train_idx = idx[n_test + n_val:]
-            logger.warning("No baked-in splits; random fallback.")
+        # Trial-level 划分
+        splits = split_trials_from_meta(meta, val_ratio=cfg.val_ratio,
+                                        test_ratio=cfg.test_ratio, seed=cfg.seed)
+        train_idx = splits["train"]
+        val_idx = splits["val"]
+        test_idx = splits["test"]
+        logger.info(f"[TRIAL-SPLIT] train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
 
-    if len(val_idx) == 0: logger.error("Empty val set."); return {"error": "empty val"}
-    if len(train_idx) == 0: logger.error("Empty train set."); return {"error": "empty train"}
+    if len(val_idx) == 0:
+        logger.error("Empty val set.")
+        return {"error": "empty val"}
+    if len(train_idx) == 0:
+        logger.error("Empty train set.")
+        return {"error": "empty train"}
 
     # ================================================================
     # STEP 3: 创建 Dataset 和 DataLoader
     # ================================================================
     train_ds = EEGWindowArrayDataset(X_full, y_full, s_full, indices=train_idx)
     val_ds = EEGWindowArrayDataset(X_full, y_full, s_full, indices=val_idx)
-    test_ds = EEGWindowArrayDataset(X_full, y_full, s_full, indices=test_idx) if len(test_idx) > 0 else None
+    test_ds = EEGWindowArrayDataset(X_full, y_full, s_full, indices=test_idx) \
+        if len(test_idx) > 0 else None
 
     nw = min(cfg.num_workers, 2)
     train_loader = make_loader(train_ds, cfg.batch_size, True, nw)
@@ -355,8 +364,9 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     summary_path = cfg.output_dir / "summary.json"
 
     with open(cfg.output_dir / "train_config.json", "w", encoding="utf-8") as f:
-        json.dump(asdict(cfg) | {"data_path": str(cfg.data_path), "output_dir": str(cfg.output_dir)},
-                  f, indent=2, ensure_ascii=False)
+        json.dump(asdict(cfg) | {
+            "data_dir": str(cfg.data_dir), "output_dir": str(cfg.output_dir)
+        }, f, indent=2, ensure_ascii=False)
 
     # Resume
     best_val_acc, best_epoch, bad_epochs = -1.0, -1, 0
@@ -368,8 +378,10 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         optimizer.load_state_dict(rs["optimizer"])
         optimizer_to(optimizer, device)
         if "scaler" in rs and use_amp:
-            try: scaler.load_state_dict(rs["scaler"])
-            except Exception: pass
+            try:
+                scaler.load_state_dict(rs["scaler"])
+            except Exception:
+                pass
         best_val_acc = float(rs.get("best_val_acc", -1.0))
         best_epoch = int(rs.get("best_epoch", -1))
         bad_epochs = int(rs.get("bad_epochs", 0))
@@ -413,29 +425,34 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 criterion = build_loss(cfg, gamma, cfg.enable_rank and gamma > 0)
 
         lr_now = cosine_lr(epoch - 1, cfg.max_epochs, cfg.lr, cfg.min_lr)
-        for pg in optimizer.param_groups: pg["lr"] = lr_now
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr_now
 
         tr, dh = train_one_epoch(model, train_loader, criterion, optimizer, scaler,
-                                  device, use_amp, cfg.grad_clip, deadline_ts)
+                                 device, use_amp, cfg.grad_clip, deadline_ts)
         va = evaluate(model, val_loader, criterion, device, use_amp)
         phase = "PRE" if is_pre else ("CLS" if cfg.freeze_intensity_head else "JOINT")
         logger.info(f"[E{epoch:03d}|{phase}] lr={lr_now:.2e} "
-                    f"tr loss={tr['loss']:.4f} acc={tr['acc']:.4f} | "
-                    f"va loss={va['loss']:.4f} acc={va['acc']:.4f} mae={va['intensity_mae']:.4f}")
+                     f"tr loss={tr['loss']:.4f} acc={tr['acc']:.4f} | "
+                     f"va loss={va['loss']:.4f} acc={va['acc']:.4f} mae={va['intensity_mae']:.4f}")
 
         if va["acc"] > best_val_acc:
             best_val_acc, best_epoch, bad_epochs = va["acc"], epoch, 0
-            torch.save({"model": model.state_dict(), "config": active_config, "val": va}, best_model_path)
+            torch.save({"model": model.state_dict(), "config": active_config, "val": va},
+                       best_model_path)
             save_encoder(best_encoder_path, model, active_config)
         else:
             bad_epochs += 1
 
         if epoch % cfg.save_interval == 0 or va["acc"] >= best_val_acc or dh:
-            save_state(state_path, epoch, model, optimizer, scaler, best_val_acc, best_epoch,
-                       bad_epochs, rse, train_idx, val_idx, test_idx, cfg)
-        if dh: logger.warning(f"[TIMEUP] @{epoch}"); break
+            save_state(state_path, epoch, model, optimizer, scaler, best_val_acc,
+                       best_epoch, bad_epochs, rse, train_idx, val_idx, test_idx, cfg)
+        if dh:
+            logger.warning(f"[TIMEUP] @{epoch}")
+            break
         if bad_epochs >= cfg.patience:
-            logger.info(f"[EARLY-STOP] @{epoch}, best={best_val_acc:.4f} @{best_epoch}"); break
+            logger.info(f"[EARLY-STOP] @{epoch}, best={best_val_acc:.4f} @{best_epoch}")
+            break
 
     if cfg.save_last:
         torch.save({"model": model.state_dict(), "config": active_config, "epoch": last_epoch},
@@ -453,9 +470,6 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         "n_params": int(n_params), "epochs_run": int(last_epoch),
         "elapsed_seconds": float(time.time() - t0),
         "model_type": cfg.model_type,
-        "freeze_intensity_head": cfg.freeze_intensity_head,
-        "train_subjects": cfg.train_subjects, "val_subjects": cfg.val_subjects,
-        "test_subjects": cfg.test_subjects,
     }
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)

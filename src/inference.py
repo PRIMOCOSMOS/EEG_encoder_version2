@@ -2,14 +2,14 @@
 from __future__ import annotations
 import json
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .config import CONFORMER_CONFIG, EEGNET_CONFIG
-from .dataset import load_dataset_npz
+from .dataset import load_multi_subject_npz
 from .model import build_model
 from .trainer import resolve_device
 
@@ -26,8 +26,8 @@ class _EEGOnly(Dataset):
 
 
 @torch.no_grad()
-def encode_npz(
-    data_path: str,
+def encode_from_npz_dir(
+    data_dir: str,
     checkpoint_path: str,
     output_path: str,
     model_type: str = "eegnet",
@@ -35,16 +35,13 @@ def encode_npz(
     batch_size: int = 256,
     device_arg: str = "auto",
     use_amp: bool = False,
-    subset: Optional[str] = None,
+    subjects: Optional[str] = None,
 ) -> None:
     device = resolve_device(device_arg)
     use_amp = bool(use_amp and device.type == "cuda")
 
-    x, y, s, meta, splits = load_dataset_npz(data_path)
-    if subset and subset in splits:
-        sel = splits[subset]
-        x = x[sel]; y = y[sel]; s = s[sel]
-        meta = [meta[i] for i in sel.tolist()]
+    subj_list = [s.strip() for s in subjects.split(",")] if subjects else None
+    x, y, s, meta = load_multi_subject_npz(data_dir, subjects=subj_list)
 
     cfg = EEGNET_CONFIG if model_type == "eegnet" else CONFORMER_CONFIG
     model = build_model(model_type, cfg).to(device)
@@ -54,7 +51,7 @@ def encode_npz(
     model.eval()
 
     ds = _EEGOnly(x)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     feats, cls_preds, int_preds = [], [], []
     for xb in loader:
@@ -66,7 +63,7 @@ def encode_npz(
         cls_preds.append(logits.argmax(dim=1).detach().cpu().numpy())
         int_preds.append(pred_s.detach().cpu().numpy())
 
-    F = np.concatenate(feats, axis=0)
+    F_arr = np.concatenate(feats, axis=0)
     Yp = np.concatenate(cls_preds, axis=0)
     Sp = np.concatenate(int_preds, axis=0)
 
@@ -74,7 +71,7 @@ def encode_npz(
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out,
-        features=F.astype(np.float32),
+        features=F_arr.astype(np.float32),
         cls_pred=Yp.astype(np.int64),
         intensity_pred=Sp.astype(np.float32),
         labels=np.asarray(y, dtype=np.int64),
@@ -83,4 +80,4 @@ def encode_npz(
         feature_type=np.asarray(feature_type),
         model_type=np.asarray(model_type),
     )
-    print(f"[DONE] features={F.shape} -> {out}")
+    print(f"[DONE] features={F_arr.shape} -> {out}")
