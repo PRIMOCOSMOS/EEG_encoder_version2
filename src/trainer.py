@@ -5,23 +5,26 @@
 - Pass 1: scan_npz_metadata 只加载 y/s/meta (< 50 MB)
 - Pass 2: MmapXStore 将每个 npz 的 X 解压为 .npy → memmap (内存 ≈ 0)
 - EEGMmapDataset.__getitem__ 从 memmap 按需读一条，OS 页面缓存管理
-- 训练循环不变
 
-新增：
-- split_mode 参数支持 "all"（全被试混合分割，原始行为）
-  和 "per_subject"（每个被试独立 trial-level 分割，再合并）
+两种训练入口：
+- run_training(cfg)             : 全被试混合训练，一个模型（原始行为）
+- run_training_per_subject(cfg) : 每个被试独立训练，输出 N 个模型（被试内泛化）
+
+样本均衡：
+- 训练集使用 WeightedRandomSampler，按各类样本数倒数加权
+- 验证集、测试集保持原始分布（不均衡），反映真实场景
 """
 from __future__ import annotations
 
 import gc, json, logging, math, os, random, time
+import copy
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from .config import CONFORMER_CONFIG, EEGNET_CONFIG, TRAIN_DEFAULTS
 from .dataset import (
@@ -30,14 +33,14 @@ from .dataset import (
     filter_by_subjects,
     scan_npz_metadata,
     split_trials_from_meta,
-    split_trials_per_subject,      # ★ 新增导入
 )
 from .losses import LossConfig, WeightedDualLoss
 from .model import build_model, count_parameters, freeze_intensity_head
 
+
 @dataclass
 class TrainConfig:
-    data_dir: Path              # 存放 per-subject .npz 文件的目录
+    data_dir: Path
     output_dir: Path
     seed: int                   = int(TRAIN_DEFAULTS["seed"])
     batch_size: int             = int(TRAIN_DEFAULTS["batch_size"])
@@ -80,11 +83,10 @@ class TrainConfig:
     model_type: str             = str(TRAIN_DEFAULTS["model_type"])
     val_ratio: float            = float(TRAIN_DEFAULTS["val_ratio"])
     test_ratio: float           = float(TRAIN_DEFAULTS["test_ratio"])
-    mmap_cache_dir: str         = ""   # memmap 缓存目录（默认: output_dir/_mmap_cache）
-    # ★ 新增：分割模式
-    # "all"        : 全被试 trial 混合后随机分割（原始行为，跨被试泛化）
-    # "per_subject": 每个被试独立 trial-level 分割，再合并（被试内泛化）
-    split_mode: str             = str(TRAIN_DEFAULTS.get("split_mode", "all"))
+    mmap_cache_dir: str         = ""
+    # ★ 样本均衡开关：True = 训练集用 WeightedRandomSampler 均衡各类
+    balance_train: bool         = bool(TRAIN_DEFAULTS.get("balance_train", True))
+
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -111,9 +113,9 @@ def optimizer_to(opt, device):
             if torch.is_tensor(v):
                 st[k] = v.to(device)
 
-def setup_logger(od: Path):
+def setup_logger(od: Path, name: str = "seed_vii_trainer"):
     od.mkdir(parents=True, exist_ok=True)
-    lg = logging.getLogger("seed_vii_trainer")
+    lg = logging.getLogger(name)
     lg.setLevel(logging.INFO)
     lg.handlers.clear()
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -139,6 +141,46 @@ def gamma_schedule(ep, cfg, started):
 
 def _parse_subjects(s: str) -> List[str]:
     return [p.strip() for p in s.split(",") if p.strip()]
+
+
+# --------------------------------------------------------------------------
+# ★ 训练集均衡采样器
+# --------------------------------------------------------------------------
+
+def make_balanced_sampler(y: np.ndarray, indices: np.ndarray) -> WeightedRandomSampler:
+    """对训练集按类别频率倒数加权，使每个 epoch 中各类期望样本数相等。
+
+    Args:
+        y:       全局标签数组 (N_total,)
+        indices: 训练集在 y 中的索引
+
+    Returns:
+        WeightedRandomSampler，replacement=True，num_samples = len(indices)
+    """
+    labels = y[indices]                          # 训练集标签
+    classes, counts = np.unique(labels, return_counts=True)
+    # 每个类的权重 = 1 / count，归一化使总权重 = n_classes
+    class_weight = {c: 1.0 / cnt for c, cnt in zip(classes.tolist(), counts.tolist())}
+    sample_weights = np.array([class_weight[int(lbl)] for lbl in labels], dtype=np.float64)
+    sample_weights /= sample_weights.sum()       # 归一化为概率分布
+
+    return WeightedRandomSampler(
+        weights=torch.from_numpy(sample_weights).float(),
+        num_samples=len(indices),                # 每 epoch 采样数与原训练集相同
+        replacement=True,                        # 有放回采样，少数类可被重复采到
+    )
+
+
+def make_balanced_loader(ds, y_all: np.ndarray, train_idx: np.ndarray,
+                         bs: int, nw: int, pin: bool = False) -> DataLoader:
+    """构造均衡训练 DataLoader（用 sampler 替代 shuffle）。"""
+    sampler = make_balanced_sampler(y_all, train_idx)
+    return DataLoader(
+        ds, batch_size=bs, sampler=sampler,
+        num_workers=nw, pin_memory=pin,
+        persistent_workers=False, drop_last=False,
+    )
+
 
 # --------------------------------------------------------------------------
 # Loss / eval / train
@@ -244,180 +286,78 @@ def make_loader(ds, bs, shuffle, nw, pin=False, pw=False):
                       drop_last=False)
 
 # --------------------------------------------------------------------------
-# MAIN TRAINING ORCHESTRATOR — OOM-safe
+# 内部核心：跑完整训练循环
 # --------------------------------------------------------------------------
 
-def run_training(cfg: TrainConfig) -> Dict[str, object]:
-    cfg.output_dir = Path(cfg.output_dir)
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    set_seed(cfg.seed)
-    logger = setup_logger(cfg.output_dir)
+def _run_single_training(
+    cfg: TrainConfig,
+    x_store: MmapXStore,
+    file_map: np.ndarray,
+    y_all: np.ndarray,
+    s_all: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    output_dir: Path,
+    logger,
+    active_config: dict,
+    model_label: str = "",
+) -> Dict:
     device = resolve_device(cfg.device)
     use_amp = bool(cfg.amp and device.type == "cuda")
 
-    # 验证 split_mode
-    valid_split_modes = ("all", "per_subject")
-    if cfg.split_mode not in valid_split_modes:
-        raise ValueError(f"split_mode must be one of {valid_split_modes}, got '{cfg.split_mode}'")
-    logger.info(f"[CONFIG] split_mode = '{cfg.split_mode}'")
-
-    # ================================================================
-    # STEP 0: 构建模型
-    # ================================================================
-    if cfg.model_type == "eegnet":
-        model = build_model("eegnet", EEGNET_CONFIG)
-        active_config = EEGNET_CONFIG
-        logger.info(f"[MODEL] EEGNet (F1={EEGNET_CONFIG['F1']}, D={EEGNET_CONFIG['D']}, "
-                    f"kernLength={EEGNET_CONFIG['kernLength']})")
-    elif cfg.model_type == "conformer":
-        model = build_model("conformer", CONFORMER_CONFIG)
-        active_config = CONFORMER_CONFIG
-        logger.info(f"[MODEL] EEGConformer (embed={CONFORMER_CONFIG['embed_dim']})")
-    else:
-        raise ValueError(f"Unknown model_type: {cfg.model_type}")
-
+    model = build_model(cfg.model_type,
+                        EEGNET_CONFIG if cfg.model_type == "eegnet" else CONFORMER_CONFIG)
     model = model.to(device)
-
     if cfg.freeze_intensity_head:
-        nf = freeze_intensity_head(model)
-        n_params = count_parameters(model)
-        logger.info(f"[FREEZE] {nf:,} frozen, {n_params:,} trainable")
-    else:
-        n_params = count_parameters(model)
-        logger.info(f"[MODEL] Params={n_params:,} ({n_params/1e6:.4f}M)")
+        freeze_intensity_head(model)
+    n_params = count_parameters(model)
+    logger.info(f"{model_label}[MODEL] {cfg.model_type}, params={n_params:,}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr,
                                  betas=(cfg.beta1, cfg.beta2),
                                  weight_decay=cfg.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    # ================================================================
-    # STEP 1: 轻量扫描 — 只加载 y/s/meta (< 50 MB)，X 不碰
-    # ================================================================
-    train_subj = _parse_subjects(cfg.train_subjects)
-    val_subj   = _parse_subjects(cfg.val_subjects)
-    test_subj  = _parse_subjects(cfg.test_subjects)
-
-    all_subjects = None
-    if train_subj or val_subj or test_subj:
-        all_subjects = list(set(train_subj + val_subj + test_subj))
-
-    npz_paths, y_all, s_all, meta, file_map = scan_npz_metadata(
-        str(cfg.data_dir), subjects=all_subjects)
-    n_total = len(y_all)
-    logger.info(f"Data: N={n_total} windows across {len(npz_paths)} files "
-                f"(y/s/meta only, X not loaded yet)")
-
-    # ================================================================
-    # STEP 2: 构建 memmap X store — 解压 npz→.npy→memmap，≈0 RAM
-    # ================================================================
-    mmap_dir = cfg.mmap_cache_dir if cfg.mmap_cache_dir else \
-        str(cfg.output_dir / "_mmap_cache")
-    logger.info(f"[MMAP] Building memmap X store at {mmap_dir} ...")
-    x_store = MmapXStore(npz_paths, cache_dir=mmap_dir)
-    logger.info(f"[MMAP] Done. X data served via memmap (RAM ≈ 0).")
-
-    # ================================================================
-    # STEP 3: 确定 train/val/test indices
-    # ================================================================
-    use_subj_filter = bool(train_subj or val_subj or test_subj)
-
-    if use_subj_filter:
-        # ---- 被试级过滤（按被试 ID 明确指定划分）----
-        all_subj_in_data = sorted(set(str(m.get("subject", "")) for m in meta))
-        if train_subj:
-            train_idx = filter_by_subjects(meta, train_subj)
-        else:
-            excl = set(val_subj) | set(test_subj)
-            train_idx = filter_by_subjects(
-                meta, [s for s in all_subj_in_data if s not in excl])
-
-        if val_subj:
-            val_idx = filter_by_subjects(meta, val_subj)
-        else:
-            rng = np.random.default_rng(cfg.seed)
-            pool = np.setdiff1d(np.arange(n_total), train_idx)
-            n_val = max(1, int(round(len(pool) * cfg.val_ratio)))
-            val_idx = np.sort(rng.choice(pool, size=min(n_val, len(pool)), replace=False))
-
-        if test_subj:
-            test_idx = filter_by_subjects(meta, test_subj)
-        else:
-            used = set(train_idx.tolist()) | set(val_idx.tolist())
-            pool = np.array([i for i in range(n_total) if i not in used])
-            if len(pool) > 0:
-                rng = np.random.default_rng(cfg.seed + 1)
-                n_test = max(1, int(round(len(pool) * 0.5)))
-                test_idx = np.sort(rng.choice(pool, size=min(n_test, len(pool)), replace=False))
-            else:
-                test_idx = np.array([], dtype=np.int64)
-        logger.info(f"[SUBJECT-FILTER] train={len(train_idx)}, "
-                    f"val={len(val_idx)}, test={len(test_idx)}")
-
-    elif cfg.split_mode == "per_subject":
-        # ★ ---- 单被试 trial-level 分割（新功能）----
-        logger.info("[PER-SUBJ SPLIT] Splitting trials independently per subject ...")
-        splits = split_trials_per_subject(
-            meta, val_ratio=cfg.val_ratio, test_ratio=cfg.test_ratio, seed=cfg.seed)
-        train_idx = splits["train"]
-        val_idx   = splits["val"]
-        test_idx  = splits["test"]
-        logger.info(f"[PER-SUBJ SPLIT] train={len(train_idx)}, "
-                    f"val={len(val_idx)}, test={len(test_idx)}")
-
-    else:
-        # ---- 全被试混合 trial-level 分割（原始行为）----
-        logger.info("[TRIAL-SPLIT] Splitting all subjects' trials globally ...")
-        splits = split_trials_from_meta(
-            meta, val_ratio=cfg.val_ratio, test_ratio=cfg.test_ratio, seed=cfg.seed)
-        train_idx = splits["train"]
-        val_idx   = splits["val"]
-        test_idx  = splits["test"]
-        logger.info(f"[TRIAL-SPLIT] train={len(train_idx)}, "
-                    f"val={len(val_idx)}, test={len(test_idx)}")
-
-    if len(val_idx) == 0:
-        logger.error("Empty val set.")
-        x_store.close()
-        return {"error": "empty val"}
-    if len(train_idx) == 0:
-        logger.error("Empty train set.")
-        x_store.close()
-        return {"error": "empty train"}
-
-    # ================================================================
-    # STEP 4: 创建 Dataset 和 DataLoader (memmap-backed, ≈0 RAM)
-    # ================================================================
+    # Dataset
     train_ds = EEGMmapDataset(x_store, file_map, y_all, s_all, indices=train_idx)
     val_ds   = EEGMmapDataset(x_store, file_map, y_all, s_all, indices=val_idx)
     test_ds  = EEGMmapDataset(x_store, file_map, y_all, s_all, indices=test_idx) \
                if len(test_idx) > 0 else None
 
-    # num_workers=0 避免 memmap 在 fork 子进程中出问题
     nw = min(cfg.num_workers, 2)
-    train_loader = make_loader(train_ds, cfg.batch_size, True, nw, pin=cfg.pin_memory)
-    val_loader   = make_loader(val_ds, cfg.batch_size, False, nw, pin=cfg.pin_memory)
-    test_loader  = make_loader(test_ds, cfg.batch_size, False, nw, pin=cfg.pin_memory) \
-                   if test_ds else None
 
-    logger.info(f"[LOADER] train={len(train_ds)}, val={len(val_ds)}, "
+    # ★ 训练集：均衡采样 vs 普通 shuffle
+    if cfg.balance_train:
+        train_loader = make_balanced_loader(
+            train_ds, y_all, train_idx, cfg.batch_size, nw, pin=cfg.pin_memory)
+        # 统计均衡前后分布，写入日志
+        train_labels = y_all[train_idx]
+        classes, counts = np.unique(train_labels, return_counts=True)
+        dist_str = ", ".join(f"cls{c}:{cnt}" for c, cnt in zip(classes, counts))
+        logger.info(f"{model_label}[BALANCE] Train dist (原始): {dist_str} "
+                    f"→ WeightedRandomSampler 均衡各类至等频")
+    else:
+        train_loader = make_loader(train_ds, cfg.batch_size, True, nw, pin=cfg.pin_memory)
+
+    # 验证集、测试集：保持原始分布（不均衡），反映真实场景
+    val_loader  = make_loader(val_ds,  cfg.batch_size, False, nw, pin=cfg.pin_memory)
+    test_loader = make_loader(test_ds, cfg.batch_size, False, nw, pin=cfg.pin_memory) \
+                  if test_ds else None
+
+    logger.info(f"{model_label}[LOADER] train={len(train_ds)}, val={len(val_ds)}, "
                 f"test={len(test_ds) if test_ds else 0}, "
-                f"batch_size={cfg.batch_size}, num_workers={nw}")
+                f"batch={cfg.batch_size}, balance={cfg.balance_train}")
 
-    state_path        = Path(cfg.resume_path) if cfg.resume_path else (cfg.output_dir / "train_state.pt")
-    best_model_path   = cfg.output_dir / "best_model.pt"
-    best_encoder_path = cfg.output_dir / "best_encoder.pt"
-    summary_path      = cfg.output_dir / "summary.json"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    state_path        = output_dir / "train_state.pt"
+    best_model_path   = output_dir / "best_model.pt"
+    best_encoder_path = output_dir / "best_encoder.pt"
 
-    with open(cfg.output_dir / "train_config.json", "w", encoding="utf-8") as f:
-        json.dump(asdict(cfg) | {
-            "data_dir": str(cfg.data_dir), "output_dir": str(cfg.output_dir)
-        }, f, indent=2, ensure_ascii=False)
-
-    # Resume
     best_val_acc, best_epoch, bad_epochs = -1.0, -1, 0
     start_epoch = 1
     rse = cfg.pretrain_epochs + 1
+
     if cfg.resume and state_path.exists():
         rs = torch.load(state_path, map_location="cpu", weights_only=False)
         model.load_state_dict(rs["model"])
@@ -434,14 +374,11 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         rse          = int(rs.get("rank_started_at_epoch", rse))
         start_epoch  = int(rs.get("epoch", 0)) + 1
         del rs; gc.collect()
-        logger.info(f"[RESUME] ep {start_epoch} (best={best_val_acc:.4f} @{best_epoch})")
+        logger.info(f"{model_label}[RESUME] ep={start_epoch}, best={best_val_acc:.4f}@{best_epoch}")
 
     t0 = time.time()
     deadline_ts = t0 + cfg.max_runtime_hours * 3600 if cfg.max_runtime_hours > 0 else None
 
-    # ================================================================
-    # STEP 5: 训练循环
-    # ================================================================
     last_epoch = start_epoch - 1
     for epoch in range(start_epoch, cfg.max_epochs + 1):
         last_epoch = epoch
@@ -478,7 +415,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                                  device, use_amp, cfg.grad_clip, deadline_ts)
         va = evaluate(model, val_loader, criterion, device, use_amp)
         phase = "PRE" if is_pre else ("CLS" if cfg.freeze_intensity_head else "JOINT")
-        logger.info(f"[E{epoch:03d}|{phase}] lr={lr_now:.2e} "
+        logger.info(f"{model_label}[E{epoch:03d}|{phase}] lr={lr_now:.2e} "
                     f"tr loss={tr['loss']:.4f} acc={tr['acc']:.4f} | "
                     f"va loss={va['loss']:.4f} acc={va['acc']:.4f} mae={va['intensity_mae']:.4f}")
 
@@ -494,35 +431,296 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             save_state(state_path, epoch, model, optimizer, scaler, best_val_acc,
                        best_epoch, bad_epochs, rse, train_idx, val_idx, test_idx, cfg)
         if dh:
-            logger.warning(f"[TIMEUP] @{epoch}")
+            logger.warning(f"{model_label}[TIMEUP] @{epoch}")
             break
         if bad_epochs >= cfg.patience:
-            logger.info(f"[EARLY-STOP] @{epoch}, best={best_val_acc:.4f} @{best_epoch}")
+            logger.info(f"{model_label}[EARLY-STOP] @{epoch}, best={best_val_acc:.4f}@{best_epoch}")
             break
 
     if cfg.save_last:
         torch.save({"model": model.state_dict(), "config": active_config, "epoch": last_epoch},
-                   cfg.output_dir / "last_model.pt")
+                   output_dir / "last_model.pt")
 
     test_metrics = {}
     if best_model_path.exists() and test_loader:
         ck = torch.load(best_model_path, map_location=device, weights_only=False)
         model.load_state_dict(ck["model"]); del ck; gc.collect()
-        test_metrics = evaluate(model, test_loader, build_loss(cfg, 0.0, False), device, use_amp)
-        logger.info(f"[TEST] acc={test_metrics['acc']:.4f} mae={test_metrics['intensity_mae']:.4f}")
+        test_metrics = evaluate(model, test_loader,
+                                build_loss(cfg, 0.0, False), device, use_amp)
+        logger.info(f"{model_label}[TEST] acc={test_metrics['acc']:.4f} "
+                    f"mae={test_metrics['intensity_mae']:.4f}")
 
-    summary = {
-        "best_val_acc": best_val_acc, "best_epoch": best_epoch, "test": test_metrics,
-        "n_params": int(n_params), "epochs_run": int(last_epoch),
+    del model, optimizer, scaler
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return {
+        "best_val_acc":    best_val_acc,
+        "best_epoch":      best_epoch,
+        "test":            test_metrics,
+        "n_params":        int(n_params),
+        "epochs_run":      int(last_epoch),
         "elapsed_seconds": float(time.time() - t0),
-        "model_type": cfg.model_type,
-        "split_mode": cfg.split_mode,         # ★ 新增到摘要
+        "model_type":      cfg.model_type,
+        "balance_train":   cfg.balance_train,
     }
-    with open(summary_path, "w", encoding="utf-8") as f:
+
+
+# --------------------------------------------------------------------------
+# 入口 1：全被试混合训练
+# --------------------------------------------------------------------------
+
+def run_training(cfg: TrainConfig) -> Dict:
+    cfg.output_dir = Path(cfg.output_dir)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    set_seed(cfg.seed)
+    logger = setup_logger(cfg.output_dir)
+
+    if cfg.model_type == "eegnet":
+        active_config = EEGNET_CONFIG
+    elif cfg.model_type == "conformer":
+        active_config = CONFORMER_CONFIG
+    else:
+        raise ValueError(f"Unknown model_type: {cfg.model_type}")
+
+    train_subj = _parse_subjects(cfg.train_subjects)
+    val_subj   = _parse_subjects(cfg.val_subjects)
+    test_subj  = _parse_subjects(cfg.test_subjects)
+    all_subjects = list(set(train_subj + val_subj + test_subj)) \
+                   if (train_subj or val_subj or test_subj) else None
+
+    npz_paths, y_all, s_all, meta, file_map = scan_npz_metadata(
+        str(cfg.data_dir), subjects=all_subjects)
+    n_total = len(y_all)
+    logger.info(f"Data: N={n_total} windows across {len(npz_paths)} files")
+
+    mmap_dir = cfg.mmap_cache_dir or str(cfg.output_dir / "_mmap_cache")
+    x_store = MmapXStore(npz_paths, cache_dir=mmap_dir)
+
+    use_subj_filter = bool(train_subj or val_subj or test_subj)
+    if use_subj_filter:
+        all_subj_in_data = sorted(set(str(m.get("subject", "")) for m in meta))
+        if train_subj:
+            train_idx = filter_by_subjects(meta, train_subj)
+        else:
+            excl = set(val_subj) | set(test_subj)
+            train_idx = filter_by_subjects(
+                meta, [s for s in all_subj_in_data if s not in excl])
+        if val_subj:
+            val_idx = filter_by_subjects(meta, val_subj)
+        else:
+            rng = np.random.default_rng(cfg.seed)
+            pool = np.setdiff1d(np.arange(n_total), train_idx)
+            n_val = max(1, int(round(len(pool) * cfg.val_ratio)))
+            val_idx = np.sort(rng.choice(pool, size=min(n_val, len(pool)), replace=False))
+        if test_subj:
+            test_idx = filter_by_subjects(meta, test_subj)
+        else:
+            used = set(train_idx.tolist()) | set(val_idx.tolist())
+            pool = np.array([i for i in range(n_total) if i not in used])
+            if len(pool) > 0:
+                rng = np.random.default_rng(cfg.seed + 1)
+                n_test = max(1, int(round(len(pool) * 0.5)))
+                test_idx = np.sort(rng.choice(pool, size=min(n_test, len(pool)), replace=False))
+            else:
+                test_idx = np.array([], dtype=np.int64)
+        logger.info(f"[SUBJECT-FILTER] train={len(train_idx)}, val={len(val_idx)}, "
+                    f"test={len(test_idx)}")
+    else:
+        splits = split_trials_from_meta(
+            meta, val_ratio=cfg.val_ratio, test_ratio=cfg.test_ratio, seed=cfg.seed)
+        train_idx = splits["train"]
+        val_idx   = splits["val"]
+        test_idx  = splits["test"]
+        logger.info(f"[TRIAL-SPLIT] train={len(train_idx)}, val={len(val_idx)}, "
+                    f"test={len(test_idx)}")
+
+    if len(val_idx) == 0:
+        logger.error("Empty val set."); x_store.close(); return {"error": "empty val"}
+    if len(train_idx) == 0:
+        logger.error("Empty train set."); x_store.close(); return {"error": "empty train"}
+
+    with open(cfg.output_dir / "train_config.json", "w", encoding="utf-8") as f:
+        json.dump(asdict(cfg) | {"data_dir": str(cfg.data_dir),
+                                 "output_dir": str(cfg.output_dir)},
+                  f, indent=2, ensure_ascii=False)
+
+    summary = _run_single_training(
+        cfg, x_store, file_map, y_all, s_all,
+        train_idx, val_idx, test_idx,
+        output_dir=cfg.output_dir,
+        logger=logger,
+        active_config=active_config,
+        model_label="",
+    )
+    summary["mode"] = "all_subjects"
+
+    with open(cfg.output_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
-    logger.info(f"Summary -> {summary_path}")
+    logger.info(f"Summary -> {cfg.output_dir / 'summary.json'}")
 
-    # Cleanup memmap
     x_store.close()
-
     return summary
+
+
+# --------------------------------------------------------------------------
+# 入口 2：单被试独立训练
+# --------------------------------------------------------------------------
+
+def run_training_per_subject(cfg: TrainConfig) -> Dict:
+    """为每个被试独立训练一个模型（被试内 trial-level 分割）。"""
+    cfg.output_dir = Path(cfg.output_dir)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    set_seed(cfg.seed)
+
+    global_logger = setup_logger(cfg.output_dir, name="per_subject_global")
+
+    if cfg.model_type == "eegnet":
+        active_config = EEGNET_CONFIG
+    elif cfg.model_type == "conformer":
+        active_config = CONFORMER_CONFIG
+    else:
+        raise ValueError(f"Unknown model_type: {cfg.model_type}")
+
+    npz_dir = Path(cfg.data_dir)
+    all_npz = sorted(npz_dir.glob("*.npz"))
+    if not all_npz:
+        raise FileNotFoundError(f"No .npz files found in {cfg.data_dir}")
+
+    subject_filter = _parse_subjects(cfg.train_subjects)
+    if subject_filter:
+        all_npz = [p for p in all_npz if p.stem in subject_filter]
+        global_logger.info(f"[PER-SUBJ] Subject filter: {subject_filter}")
+
+    global_logger.info(f"[PER-SUBJ] Will train {len(all_npz)} subject model(s): "
+                       f"{[p.stem for p in all_npz]}")
+
+    all_summaries: Dict[str, Dict] = {}
+    t_total = time.time()
+    deadline_ts = (t_total + cfg.max_runtime_hours * 3600
+                   if cfg.max_runtime_hours > 0 else None)
+
+    for subj_npz in all_npz:
+        subj = subj_npz.stem
+        label = f"[Subject {subj}] "
+        subj_out = cfg.output_dir / f"subject_{subj}"
+        subj_out.mkdir(parents=True, exist_ok=True)
+
+        if deadline_ts and time.time() >= deadline_ts:
+            global_logger.warning(f"[PER-SUBJ] Time limit reached before subject {subj}.")
+            break
+
+        global_logger.info(f"\n{'='*60}")
+        global_logger.info(f"[PER-SUBJ] === Subject {subj} → {subj_out} ===")
+        global_logger.info(f"{'='*60}")
+
+        subj_logger = setup_logger(subj_out, name=f"trainer_subj_{subj}")
+
+        try:
+            npz_paths, y_all, s_all, meta, file_map = scan_npz_metadata(
+                str(npz_dir), subjects=[subj])
+        except FileNotFoundError as e:
+            global_logger.error(f"{label}npz not found: {e}")
+            continue
+
+        splits = split_trials_from_meta(
+            meta, val_ratio=cfg.val_ratio, test_ratio=cfg.test_ratio, seed=cfg.seed)
+        train_idx = splits["train"]
+        val_idx   = splits["val"]
+        test_idx  = splits["test"]
+        subj_logger.info(f"{label}Split: train={len(train_idx)}, "
+                         f"val={len(val_idx)}, test={len(test_idx)} windows")
+
+        if len(train_idx) == 0 or len(val_idx) == 0:
+            global_logger.warning(f"{label}Skipped: train or val empty.")
+            continue
+
+        mmap_dir = cfg.mmap_cache_dir or str(cfg.output_dir / "_mmap_cache")
+        x_store = MmapXStore(npz_paths, cache_dir=mmap_dir)
+
+        subj_cfg_dict = asdict(cfg) | {
+            "data_dir": str(cfg.data_dir),
+            "output_dir": str(subj_out),
+            "subject": subj,
+        }
+        with open(subj_out / "train_config.json", "w", encoding="utf-8") as f:
+            json.dump(subj_cfg_dict, f, indent=2, ensure_ascii=False)
+
+        remaining_hours = (
+            (deadline_ts - time.time()) / 3600.0
+            if deadline_ts else cfg.max_runtime_hours
+        )
+        subj_cfg = copy.copy(cfg)
+        subj_cfg.output_dir        = subj_out
+        subj_cfg.max_runtime_hours = max(0.0, remaining_hours)
+        subj_cfg.resume            = False
+
+        summary = _run_single_training(
+            subj_cfg, x_store, file_map, y_all, s_all,
+            train_idx, val_idx, test_idx,
+            output_dir=subj_out,
+            logger=subj_logger,
+            active_config=active_config,
+            model_label=label,
+        )
+        summary["subject"] = subj
+
+        with open(subj_out / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+
+        all_summaries[subj] = summary
+        global_logger.info(
+            f"{label}Done. best_val_acc={summary['best_val_acc']:.4f}, "
+            f"test_acc={summary.get('test', {}).get('acc', float('nan')):.4f}, "
+            f"test_mae={summary.get('test', {}).get('intensity_mae', float('nan')):.4f}"
+        )
+
+        x_store.close()
+        gc.collect()
+
+    if all_summaries:
+        test_accs = [v["test"]["acc"]
+                     for v in all_summaries.values()
+                     if v.get("test") and "acc" in v["test"]]
+        test_maes = [v["test"]["intensity_mae"]
+                     for v in all_summaries.values()
+                     if v.get("test") and "intensity_mae" in v["test"]]
+        val_accs  = [v["best_val_acc"] for v in all_summaries.values()]
+
+        aggregate = {
+            "mode":            "per_subject",
+            "n_subjects":      len(all_summaries),
+            "mean_val_acc":    float(np.mean(val_accs)),
+            "std_val_acc":     float(np.std(val_accs)),
+            "mean_test_acc":   float(np.mean(test_accs))  if test_accs else None,
+            "std_test_acc":    float(np.std(test_accs))   if test_accs else None,
+            "mean_test_mae":   float(np.mean(test_maes))  if test_maes else None,
+            "std_test_mae":    float(np.std(test_maes))   if test_maes else None,
+            "total_elapsed_s": float(time.time() - t_total),
+            "per_subject":     all_summaries,
+        }
+
+        out_path = cfg.output_dir / "all_summary.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(aggregate, f, indent=2, ensure_ascii=False)
+
+        global_logger.info(f"\n{'='*60}")
+        global_logger.info(f"[PER-SUBJ] ALL DONE — {len(all_summaries)} subjects")
+        if test_accs:
+            global_logger.info(
+                f"[PER-SUBJ] Test acc: mean={np.mean(test_accs):.4f} "
+                f"± {np.std(test_accs):.4f} "
+                f"(min={min(test_accs):.4f}, max={max(test_accs):.4f})"
+            )
+        if test_maes:
+            global_logger.info(
+                f"[PER-SUBJ] Test MAE: mean={np.mean(test_maes):.4f} "
+                f"± {np.std(test_maes):.4f}"
+            )
+        global_logger.info(f"[PER-SUBJ] → {out_path}")
+        global_logger.info(f"{'='*60}")
+
+        return aggregate
+
+    return {"error": "no subjects trained"}
