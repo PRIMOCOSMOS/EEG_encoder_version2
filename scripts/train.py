@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 """全被试混合训练入口（一个模型）。
 
-用法：
-    python scripts/train.py \
-      --data-dir /workspace/preprocessed \
-      --output-dir /workspace/runs \
-      --model-type eegnet \
-      --device auto --amp \
-      --max-runtime-hours 10
+训练模式（--training-mode）：
+  cls_only           只训练分类，强度头冻结，损失只有 L_cls（默认）
+  joint              全程联合训练 L_cls + L_reg
+  pretrain_then_joint 前 N epoch 只开 L_cls，之后联合训练
 
-关闭训练集均衡（默认开启）：
-    python scripts/train.py ... --no-balance-train
+用法：
+    # 只训练分类（推荐先跑）
+    python scripts/train.py \\
+      --data-dir /workspace/preprocessed \\
+      --output-dir /workspace/runs \\
+      --training-mode cls_only \\
+      --device auto --amp
+
+    # 联合训练
+    python scripts/train.py \\
+      --data-dir /workspace/preprocessed \\
+      --output-dir /workspace/runs \\
+      --training-mode joint \\
+      --device auto --amp
 """
 from __future__ import annotations
 
@@ -22,25 +31,26 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.config import TRAIN_DEFAULTS
-from src.trainer import TrainConfig, run_training
+from src.trainer import TrainConfig, run_training, VALID_TRAINING_MODES
 
 
 def parse_args() -> TrainConfig:
     p = argparse.ArgumentParser(description="Train SEED-VII dual-head model (OOM-safe)")
-    p.add_argument("--data-dir", type=str, required=True)
+    p.add_argument("--data-dir",   type=str, required=True)
     p.add_argument("--output-dir", type=str, default=str(TRAIN_DEFAULTS["output_dir"]))
-    p.add_argument("--seed", type=int, default=int(TRAIN_DEFAULTS["seed"]))
+    p.add_argument("--seed",       type=int, default=int(TRAIN_DEFAULTS["seed"]))
     p.add_argument("--batch-size", type=int, default=int(TRAIN_DEFAULTS["batch_size"]))
-    p.add_argument("--num-workers", type=int, default=int(TRAIN_DEFAULTS["num_workers"]))
-    p.add_argument("--lr", type=float, default=float(TRAIN_DEFAULTS["lr"]))
-    p.add_argument("--min-lr", type=float, default=float(TRAIN_DEFAULTS["min_lr"]))
-    p.add_argument("--weight-decay", type=float, default=float(TRAIN_DEFAULTS["weight_decay"]))
-    p.add_argument("--grad-clip", type=float, default=float(TRAIN_DEFAULTS["grad_clip"]))
-    p.add_argument("--pretrain-epochs", type=int, default=int(TRAIN_DEFAULTS["pretrain_epochs"]))
+    p.add_argument("--num-workers",type=int, default=int(TRAIN_DEFAULTS["num_workers"]))
+    p.add_argument("--lr",         type=float, default=float(TRAIN_DEFAULTS["lr"]))
+    p.add_argument("--min-lr",     type=float, default=float(TRAIN_DEFAULTS["min_lr"]))
+    p.add_argument("--weight-decay",type=float, default=float(TRAIN_DEFAULTS["weight_decay"]))
+    p.add_argument("--grad-clip",  type=float, default=float(TRAIN_DEFAULTS["grad_clip"]))
+    p.add_argument("--pretrain-epochs", type=int,
+                   default=int(TRAIN_DEFAULTS["pretrain_epochs"]))
     p.add_argument("--max-epochs", type=int, default=int(TRAIN_DEFAULTS["max_epochs"]))
-    p.add_argument("--patience", type=int, default=int(TRAIN_DEFAULTS["patience"]))
-    p.add_argument("--alpha-cls", type=float, default=float(TRAIN_DEFAULTS["alpha_cls_start"]))
-    p.add_argument("--beta-reg", type=float, default=float(TRAIN_DEFAULTS["beta_reg_start"]))
+    p.add_argument("--patience",   type=int, default=int(TRAIN_DEFAULTS["patience"]))
+    p.add_argument("--alpha-cls",  type=float, default=float(TRAIN_DEFAULTS["alpha_cls_start"]))
+    p.add_argument("--beta-reg",   type=float, default=float(TRAIN_DEFAULTS["beta_reg_start"]))
     p.add_argument("--gamma-rank-start", type=float,
                    default=float(TRAIN_DEFAULTS["gamma_rank_start"]))
     p.add_argument("--gamma-rank-end", type=float,
@@ -51,7 +61,8 @@ def parse_args() -> TrainConfig:
     p.add_argument("--rank-margin", type=float, default=float(TRAIN_DEFAULTS["rank_margin"]))
     p.add_argument("--label-smoothing", type=float,
                    default=float(TRAIN_DEFAULTS["label_smoothing"]))
-    p.add_argument("--sample-weight-mode", choices=["continuous", "threshold", "none"],
+    p.add_argument("--sample-weight-mode",
+                   choices=["continuous", "threshold", "none"],
                    default=str(TRAIN_DEFAULTS["sample_weight_mode"]))
     p.add_argument("--intensity-threshold", type=float,
                    default=float(TRAIN_DEFAULTS["intensity_threshold"]))
@@ -59,7 +70,7 @@ def parse_args() -> TrainConfig:
                    default=float(TRAIN_DEFAULTS["weak_sample_weight"]))
     p.add_argument("--device", choices=["auto", "cuda", "cpu"],
                    default=str(TRAIN_DEFAULTS["device"]))
-    p.add_argument("--amp", action="store_true")
+    p.add_argument("--amp",    action="store_true")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--resume-path", type=str, default="")
@@ -70,25 +81,34 @@ def parse_args() -> TrainConfig:
     p.add_argument("--feature-type", choices=["projected", "flatten"],
                    default=str(TRAIN_DEFAULTS["feature_type"]))
     p.add_argument("--train-subjects", type=str, default="")
-    p.add_argument("--val-subjects", type=str, default="")
-    p.add_argument("--test-subjects", type=str, default="")
-    p.add_argument("--freeze-intensity-head", action="store_true")
+    p.add_argument("--val-subjects",   type=str, default="")
+    p.add_argument("--test-subjects",  type=str, default="")
     p.add_argument("--model-type", choices=["eegnet", "conformer"],
                    default=str(TRAIN_DEFAULTS.get("model_type", "eegnet")))
-    p.add_argument("--val-ratio", type=float, default=float(TRAIN_DEFAULTS["val_ratio"]))
+    p.add_argument("--val-ratio",  type=float, default=float(TRAIN_DEFAULTS["val_ratio"]))
     p.add_argument("--test-ratio", type=float, default=float(TRAIN_DEFAULTS["test_ratio"]))
     p.add_argument("--mmap-cache-dir", type=str, default="")
-    # ★ 样本均衡开关
+    # ★ 训练模式
+    p.add_argument(
+        "--training-mode",
+        choices=list(VALID_TRAINING_MODES),
+        default=str(TRAIN_DEFAULTS.get("training_mode", "cls_only")),
+        help=(
+            "训练模式：\n"
+            "  cls_only           — 强度头冻结，只训练分类（L_cls）\n"
+            "  joint              — 全程联合训练（L_cls + L_reg）\n"
+            "  pretrain_then_joint— 前 N epoch 只开 L_cls，之后联合训练"
+        ),
+    )
+    # 样本均衡
     p.add_argument("--no-balance-train", action="store_true",
-                   help="关闭训练集类别均衡（默认开启 WeightedRandomSampler）")
+                   help="关闭训练集类别均衡（默认开启）")
 
     args = p.parse_args()
 
     amp = bool(TRAIN_DEFAULTS["amp"])
     if args.amp:    amp = True
     if args.no_amp: amp = False
-
-    balance_train = not args.no_balance_train
 
     return TrainConfig(
         data_dir=Path(args.data_dir), output_dir=Path(args.output_dir),
@@ -110,11 +130,11 @@ def parse_args() -> TrainConfig:
         save_features=args.save_features, feature_type=args.feature_type,
         train_subjects=args.train_subjects, val_subjects=args.val_subjects,
         test_subjects=args.test_subjects,
-        freeze_intensity_head=bool(args.freeze_intensity_head),
         model_type=args.model_type,
         val_ratio=args.val_ratio, test_ratio=args.test_ratio,
         mmap_cache_dir=args.mmap_cache_dir,
-        balance_train=balance_train,
+        training_mode=args.training_mode,
+        balance_train=not args.no_balance_train,
     )
 
 

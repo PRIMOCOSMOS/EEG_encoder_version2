@@ -98,9 +98,14 @@ TRAIN_DEFAULTS: Dict[str, object] = {
     "train_subjects": "",
     "val_subjects": "",
     "test_subjects": "",
-    "freeze_intensity_head": False,
-    "balance_train": True,   # 训练集 WeightedRandomSampler 类别均衡，默认开启
+    # 训练模式（替代旧的 freeze_intensity_head bool 开关）
+    # "cls_only"           : 强度头冻结，全程只训练分类，损失只有 L_cls
+    # "joint"              : 全程联合训练（L_cls + L_reg）
+    # "pretrain_then_joint": 前 pretrain_epochs 只开 L_cls，之后联合
+    "training_mode": "cls_only",
+    "balance_train": True,    # 训练集 WeightedRandomSampler 类别均衡
 }
 
 MODELSCOPE_DATASET_ID = "DEREKVERSE/SEED-VII"
 NPZ_REPO_PREFIX = "preprocessed_npz"
+
