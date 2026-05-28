@@ -6,6 +6,10 @@
 - Pass 2: MmapXStore 将每个 npz 的 X 解压为 .npy → memmap (内存 ≈ 0)
 - EEGMmapDataset.__getitem__ 从 memmap 按需读一条，OS 页面缓存管理
 - 训练循环不变
+
+新增：
+- split_mode 参数支持 "all"（全被试混合分割，原始行为）
+  和 "per_subject"（每个被试独立 trial-level 分割，再合并）
 """
 from __future__ import annotations
 
@@ -26,58 +30,61 @@ from .dataset import (
     filter_by_subjects,
     scan_npz_metadata,
     split_trials_from_meta,
+    split_trials_per_subject,      # ★ 新增导入
 )
 from .losses import LossConfig, WeightedDualLoss
 from .model import build_model, count_parameters, freeze_intensity_head
-
 
 @dataclass
 class TrainConfig:
     data_dir: Path              # 存放 per-subject .npz 文件的目录
     output_dir: Path
-    seed: int = int(TRAIN_DEFAULTS["seed"])
-    batch_size: int = int(TRAIN_DEFAULTS["batch_size"])
-    num_workers: int = int(TRAIN_DEFAULTS["num_workers"])
-    lr: float = float(TRAIN_DEFAULTS["lr"])
-    min_lr: float = float(TRAIN_DEFAULTS["min_lr"])
-    beta1: float = float(TRAIN_DEFAULTS["beta1"])
-    beta2: float = float(TRAIN_DEFAULTS["beta2"])
-    weight_decay: float = float(TRAIN_DEFAULTS["weight_decay"])
-    grad_clip: float = float(TRAIN_DEFAULTS["grad_clip"])
-    pretrain_epochs: int = int(TRAIN_DEFAULTS["pretrain_epochs"])
-    max_epochs: int = int(TRAIN_DEFAULTS["max_epochs"])
-    patience: int = int(TRAIN_DEFAULTS["patience"])
-    alpha_cls: float = float(TRAIN_DEFAULTS["alpha_cls_start"])
-    beta_reg: float = float(TRAIN_DEFAULTS["beta_reg_start"])
-    gamma_rank_start: float = float(TRAIN_DEFAULTS["gamma_rank_start"])
-    gamma_rank_end: float = float(TRAIN_DEFAULTS["gamma_rank_end"])
-    rank_warmup_epochs: int = int(TRAIN_DEFAULTS["rank_warmup_epochs"])
-    enable_rank: bool = bool(TRAIN_DEFAULTS["enable_rank"])
-    rank_margin: float = float(TRAIN_DEFAULTS["rank_margin"])
-    label_smoothing: float = float(TRAIN_DEFAULTS["label_smoothing"])
-    sample_weight_mode: str = str(TRAIN_DEFAULTS["sample_weight_mode"])
-    intensity_threshold: float = float(TRAIN_DEFAULTS["intensity_threshold"])
-    weak_sample_weight: float = float(TRAIN_DEFAULTS["weak_sample_weight"])
-    device: str = str(TRAIN_DEFAULTS["device"])
-    amp: bool = bool(TRAIN_DEFAULTS["amp"])
-    save_last: bool = bool(TRAIN_DEFAULTS["save_last"])
-    save_features: bool = bool(TRAIN_DEFAULTS["save_features"])
-    feature_type: str = str(TRAIN_DEFAULTS["feature_type"])
-    resume: bool = False
-    resume_path: str = ""
-    save_interval: int = int(TRAIN_DEFAULTS["save_interval"])
-    max_runtime_hours: float = float(TRAIN_DEFAULTS["max_runtime_hours"])
-    pin_memory: bool = False
-    persistent_workers: bool = False
+    seed: int                   = int(TRAIN_DEFAULTS["seed"])
+    batch_size: int             = int(TRAIN_DEFAULTS["batch_size"])
+    num_workers: int            = int(TRAIN_DEFAULTS["num_workers"])
+    lr: float                   = float(TRAIN_DEFAULTS["lr"])
+    min_lr: float               = float(TRAIN_DEFAULTS["min_lr"])
+    beta1: float                = float(TRAIN_DEFAULTS["beta1"])
+    beta2: float                = float(TRAIN_DEFAULTS["beta2"])
+    weight_decay: float         = float(TRAIN_DEFAULTS["weight_decay"])
+    grad_clip: float            = float(TRAIN_DEFAULTS["grad_clip"])
+    pretrain_epochs: int        = int(TRAIN_DEFAULTS["pretrain_epochs"])
+    max_epochs: int             = int(TRAIN_DEFAULTS["max_epochs"])
+    patience: int               = int(TRAIN_DEFAULTS["patience"])
+    alpha_cls: float            = float(TRAIN_DEFAULTS["alpha_cls_start"])
+    beta_reg: float             = float(TRAIN_DEFAULTS["beta_reg_start"])
+    gamma_rank_start: float     = float(TRAIN_DEFAULTS["gamma_rank_start"])
+    gamma_rank_end: float       = float(TRAIN_DEFAULTS["gamma_rank_end"])
+    rank_warmup_epochs: int     = int(TRAIN_DEFAULTS["rank_warmup_epochs"])
+    enable_rank: bool           = bool(TRAIN_DEFAULTS["enable_rank"])
+    rank_margin: float          = float(TRAIN_DEFAULTS["rank_margin"])
+    label_smoothing: float      = float(TRAIN_DEFAULTS["label_smoothing"])
+    sample_weight_mode: str     = str(TRAIN_DEFAULTS["sample_weight_mode"])
+    intensity_threshold: float  = float(TRAIN_DEFAULTS["intensity_threshold"])
+    weak_sample_weight: float   = float(TRAIN_DEFAULTS["weak_sample_weight"])
+    device: str                 = str(TRAIN_DEFAULTS["device"])
+    amp: bool                   = bool(TRAIN_DEFAULTS["amp"])
+    save_last: bool             = bool(TRAIN_DEFAULTS["save_last"])
+    save_features: bool         = bool(TRAIN_DEFAULTS["save_features"])
+    feature_type: str           = str(TRAIN_DEFAULTS["feature_type"])
+    resume: bool                = False
+    resume_path: str            = ""
+    save_interval: int          = int(TRAIN_DEFAULTS["save_interval"])
+    max_runtime_hours: float    = float(TRAIN_DEFAULTS["max_runtime_hours"])
+    pin_memory: bool            = False
+    persistent_workers: bool    = False
     freeze_intensity_head: bool = False
-    train_subjects: str = ""
-    val_subjects: str = ""
-    test_subjects: str = ""
-    model_type: str = str(TRAIN_DEFAULTS["model_type"])
-    val_ratio: float = float(TRAIN_DEFAULTS["val_ratio"])
-    test_ratio: float = float(TRAIN_DEFAULTS["test_ratio"])
-    mmap_cache_dir: str = ""    # memmap 缓存目录（默认: output_dir/_mmap_cache）
-
+    train_subjects: str         = ""
+    val_subjects: str           = ""
+    test_subjects: str          = ""
+    model_type: str             = str(TRAIN_DEFAULTS["model_type"])
+    val_ratio: float            = float(TRAIN_DEFAULTS["val_ratio"])
+    test_ratio: float           = float(TRAIN_DEFAULTS["test_ratio"])
+    mmap_cache_dir: str         = ""   # memmap 缓存目录（默认: output_dir/_mmap_cache）
+    # ★ 新增：分割模式
+    # "all"        : 全被试 trial 混合后随机分割（原始行为，跨被试泛化）
+    # "per_subject": 每个被试独立 trial-level 分割，再合并（被试内泛化）
+    split_mode: str             = str(TRAIN_DEFAULTS.get("split_mode", "all"))
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -133,7 +140,6 @@ def gamma_schedule(ep, cfg, started):
 def _parse_subjects(s: str) -> List[str]:
     return [p.strip() for p in s.split(",") if p.strip()]
 
-
 # --------------------------------------------------------------------------
 # Loss / eval / train
 # --------------------------------------------------------------------------
@@ -162,14 +168,14 @@ def evaluate(model, loader, criterion, device, use_amp):
             _, parts = criterion(logits, ps, yb, sb)
         losses.append(parts["loss"]); cls_l.append(parts["cls"]); reg_l.append(parts["reg"])
         correct += (logits.argmax(1) == yb).sum().item()
-        total += yb.numel()
+        total   += yb.numel()
         abs_err += (ps - sb).abs().sum().item()
     n = max(1, total)
     return {
         "loss": float(np.mean(losses)) if losses else float("nan"),
-        "cls": float(np.mean(cls_l)) if cls_l else float("nan"),
-        "reg": float(np.mean(reg_l)) if reg_l else float("nan"),
-        "acc": correct / n,
+        "cls":  float(np.mean(cls_l))  if cls_l  else float("nan"),
+        "reg":  float(np.mean(reg_l))  if reg_l  else float("nan"),
+        "acc":  correct / n,
         "intensity_mae": abs_err / n,
     }
 
@@ -203,16 +209,15 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_amp
         losses.append(parts["loss"]); cls_l.append(parts["cls"])
         reg_l.append(parts["reg"]); rank_l.append(parts["rank"])
         correct += (logits.argmax(1) == yb).sum().item()
-        total += yb.numel()
+        total   += yb.numel()
     n = max(1, total)
     return {
         "loss": float(np.mean(losses)) if losses else float("nan"),
-        "cls": float(np.mean(cls_l)) if cls_l else float("nan"),
-        "reg": float(np.mean(reg_l)) if reg_l else float("nan"),
+        "cls":  float(np.mean(cls_l))  if cls_l  else float("nan"),
+        "reg":  float(np.mean(reg_l))  if reg_l  else float("nan"),
         "rank": float(np.mean(rank_l)) if rank_l else 0.0,
-        "acc": correct / n,
+        "acc":  correct / n,
     }, hit_deadline
-
 
 # --------------------------------------------------------------------------
 # Checkpoint I/O
@@ -238,7 +243,6 @@ def make_loader(ds, bs, shuffle, nw, pin=False, pw=False):
                       pin_memory=pin, persistent_workers=pw if nw > 0 else False,
                       drop_last=False)
 
-
 # --------------------------------------------------------------------------
 # MAIN TRAINING ORCHESTRATOR — OOM-safe
 # --------------------------------------------------------------------------
@@ -251,6 +255,12 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     device = resolve_device(cfg.device)
     use_amp = bool(cfg.amp and device.type == "cuda")
 
+    # 验证 split_mode
+    valid_split_modes = ("all", "per_subject")
+    if cfg.split_mode not in valid_split_modes:
+        raise ValueError(f"split_mode must be one of {valid_split_modes}, got '{cfg.split_mode}'")
+    logger.info(f"[CONFIG] split_mode = '{cfg.split_mode}'")
+
     # ================================================================
     # STEP 0: 构建模型
     # ================================================================
@@ -258,7 +268,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         model = build_model("eegnet", EEGNET_CONFIG)
         active_config = EEGNET_CONFIG
         logger.info(f"[MODEL] EEGNet (F1={EEGNET_CONFIG['F1']}, D={EEGNET_CONFIG['D']}, "
-                     f"kernLength={EEGNET_CONFIG['kernLength']})")
+                    f"kernLength={EEGNET_CONFIG['kernLength']})")
     elif cfg.model_type == "conformer":
         model = build_model("conformer", CONFORMER_CONFIG)
         active_config = CONFORMER_CONFIG
@@ -274,7 +284,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         logger.info(f"[FREEZE] {nf:,} frozen, {n_params:,} trainable")
     else:
         n_params = count_parameters(model)
-    logger.info(f"[MODEL] Params={n_params:,} ({n_params/1e6:.4f}M)")
+        logger.info(f"[MODEL] Params={n_params:,} ({n_params/1e6:.4f}M)")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr,
                                  betas=(cfg.beta1, cfg.beta2),
@@ -285,8 +295,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     # STEP 1: 轻量扫描 — 只加载 y/s/meta (< 50 MB)，X 不碰
     # ================================================================
     train_subj = _parse_subjects(cfg.train_subjects)
-    val_subj = _parse_subjects(cfg.val_subjects)
-    test_subj = _parse_subjects(cfg.test_subjects)
+    val_subj   = _parse_subjects(cfg.val_subjects)
+    test_subj  = _parse_subjects(cfg.test_subjects)
 
     all_subjects = None
     if train_subj or val_subj or test_subj:
@@ -313,6 +323,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     use_subj_filter = bool(train_subj or val_subj or test_subj)
 
     if use_subj_filter:
+        # ---- 被试级过滤（按被试 ID 明确指定划分）----
         all_subj_in_data = sorted(set(str(m.get("subject", "")) for m in meta))
         if train_subj:
             train_idx = filter_by_subjects(meta, train_subj)
@@ -341,15 +352,29 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             else:
                 test_idx = np.array([], dtype=np.int64)
         logger.info(f"[SUBJECT-FILTER] train={len(train_idx)}, "
-                     f"val={len(val_idx)}, test={len(test_idx)}")
-    else:
-        splits = split_trials_from_meta(meta, val_ratio=cfg.val_ratio,
-                                        test_ratio=cfg.test_ratio, seed=cfg.seed)
+                    f"val={len(val_idx)}, test={len(test_idx)}")
+
+    elif cfg.split_mode == "per_subject":
+        # ★ ---- 单被试 trial-level 分割（新功能）----
+        logger.info("[PER-SUBJ SPLIT] Splitting trials independently per subject ...")
+        splits = split_trials_per_subject(
+            meta, val_ratio=cfg.val_ratio, test_ratio=cfg.test_ratio, seed=cfg.seed)
         train_idx = splits["train"]
-        val_idx = splits["val"]
-        test_idx = splits["test"]
+        val_idx   = splits["val"]
+        test_idx  = splits["test"]
+        logger.info(f"[PER-SUBJ SPLIT] train={len(train_idx)}, "
+                    f"val={len(val_idx)}, test={len(test_idx)}")
+
+    else:
+        # ---- 全被试混合 trial-level 分割（原始行为）----
+        logger.info("[TRIAL-SPLIT] Splitting all subjects' trials globally ...")
+        splits = split_trials_from_meta(
+            meta, val_ratio=cfg.val_ratio, test_ratio=cfg.test_ratio, seed=cfg.seed)
+        train_idx = splits["train"]
+        val_idx   = splits["val"]
+        test_idx  = splits["test"]
         logger.info(f"[TRIAL-SPLIT] train={len(train_idx)}, "
-                     f"val={len(val_idx)}, test={len(test_idx)}")
+                    f"val={len(val_idx)}, test={len(test_idx)}")
 
     if len(val_idx) == 0:
         logger.error("Empty val set.")
@@ -364,28 +389,25 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     # STEP 4: 创建 Dataset 和 DataLoader (memmap-backed, ≈0 RAM)
     # ================================================================
     train_ds = EEGMmapDataset(x_store, file_map, y_all, s_all, indices=train_idx)
-    val_ds = EEGMmapDataset(x_store, file_map, y_all, s_all, indices=val_idx)
-    test_ds = EEGMmapDataset(x_store, file_map, y_all, s_all, indices=test_idx) \
-        if len(test_idx) > 0 else None
+    val_ds   = EEGMmapDataset(x_store, file_map, y_all, s_all, indices=val_idx)
+    test_ds  = EEGMmapDataset(x_store, file_map, y_all, s_all, indices=test_idx) \
+               if len(test_idx) > 0 else None
 
     # num_workers=0 避免 memmap 在 fork 子进程中出问题
-    # 如果要 num_workers > 0，需要确认 memmap 在 fork 后是安全的
     nw = min(cfg.num_workers, 2)
-    train_loader = make_loader(train_ds, cfg.batch_size, True, nw,
-                               pin=cfg.pin_memory)
-    val_loader = make_loader(val_ds, cfg.batch_size, False, nw,
-                              pin=cfg.pin_memory)
-    test_loader = make_loader(test_ds, cfg.batch_size, False, nw,
-                               pin=cfg.pin_memory) if test_ds else None
+    train_loader = make_loader(train_ds, cfg.batch_size, True, nw, pin=cfg.pin_memory)
+    val_loader   = make_loader(val_ds, cfg.batch_size, False, nw, pin=cfg.pin_memory)
+    test_loader  = make_loader(test_ds, cfg.batch_size, False, nw, pin=cfg.pin_memory) \
+                   if test_ds else None
 
     logger.info(f"[LOADER] train={len(train_ds)}, val={len(val_ds)}, "
                 f"test={len(test_ds) if test_ds else 0}, "
                 f"batch_size={cfg.batch_size}, num_workers={nw}")
 
-    state_path = Path(cfg.resume_path) if cfg.resume_path else (cfg.output_dir / "train_state.pt")
-    best_model_path = cfg.output_dir / "best_model.pt"
+    state_path        = Path(cfg.resume_path) if cfg.resume_path else (cfg.output_dir / "train_state.pt")
+    best_model_path   = cfg.output_dir / "best_model.pt"
     best_encoder_path = cfg.output_dir / "best_encoder.pt"
-    summary_path = cfg.output_dir / "summary.json"
+    summary_path      = cfg.output_dir / "summary.json"
 
     with open(cfg.output_dir / "train_config.json", "w", encoding="utf-8") as f:
         json.dump(asdict(cfg) | {
@@ -407,10 +429,10 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             except Exception:
                 pass
         best_val_acc = float(rs.get("best_val_acc", -1.0))
-        best_epoch = int(rs.get("best_epoch", -1))
-        bad_epochs = int(rs.get("bad_epochs", 0))
-        rse = int(rs.get("rank_started_at_epoch", rse))
-        start_epoch = int(rs.get("epoch", 0)) + 1
+        best_epoch   = int(rs.get("best_epoch", -1))
+        bad_epochs   = int(rs.get("bad_epochs", 0))
+        rse          = int(rs.get("rank_started_at_epoch", rse))
+        start_epoch  = int(rs.get("epoch", 0)) + 1
         del rs; gc.collect()
         logger.info(f"[RESUME] ep {start_epoch} (best={best_val_acc:.4f} @{best_epoch})")
 
@@ -457,8 +479,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         va = evaluate(model, val_loader, criterion, device, use_amp)
         phase = "PRE" if is_pre else ("CLS" if cfg.freeze_intensity_head else "JOINT")
         logger.info(f"[E{epoch:03d}|{phase}] lr={lr_now:.2e} "
-                     f"tr loss={tr['loss']:.4f} acc={tr['acc']:.4f} | "
-                     f"va loss={va['loss']:.4f} acc={va['acc']:.4f} mae={va['intensity_mae']:.4f}")
+                    f"tr loss={tr['loss']:.4f} acc={tr['acc']:.4f} | "
+                    f"va loss={va['loss']:.4f} acc={va['acc']:.4f} mae={va['intensity_mae']:.4f}")
 
         if va["acc"] > best_val_acc:
             best_val_acc, best_epoch, bad_epochs = va["acc"], epoch, 0
@@ -494,6 +516,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         "n_params": int(n_params), "epochs_run": int(last_epoch),
         "elapsed_seconds": float(time.time() - t0),
         "model_type": cfg.model_type,
+        "split_mode": cfg.split_mode,         # ★ 新增到摘要
     }
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)

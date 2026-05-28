@@ -3,13 +3,23 @@
 
 核心：不一次性加载全部 X 到 RAM，用 memmap 流式读取。
 
-用法:
-  python scripts/train.py \
-    --data-dir /workspace/preprocessed \
-    --output-dir /workspace/runs \
-    --model-type eegnet \
-    --device auto --amp \
-    --max-runtime-hours 10
+用法（全被试混合 trial-level 分割，原始行为）:
+    python scripts/train.py \
+      --data-dir /workspace/preprocessed \
+      --output-dir /workspace/runs \
+      --split-mode all \
+      --model-type eegnet \
+      --device auto --amp \
+      --max-runtime-hours 10
+
+用法（单被试独立 trial-level 分割，新功能）:
+    python scripts/train.py \
+      --data-dir /workspace/preprocessed \
+      --output-dir /workspace/runs_per_subject \
+      --split-mode per_subject \
+      --model-type eegnet \
+      --device auto --amp \
+      --max-runtime-hours 10
 """
 from __future__ import annotations
 
@@ -22,7 +32,6 @@ sys.path.insert(0, str(ROOT))
 
 from src.config import TRAIN_DEFAULTS
 from src.trainer import TrainConfig, run_training
-
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train SEED-VII dual-head model (OOM-safe)")
@@ -84,6 +93,18 @@ def parse_args():
     p.add_argument("--mmap-cache-dir", type=str, default="",
                    help="Directory for memmap .npy cache (default: output_dir/_mmap_cache). "
                         "Set to a fast disk for best I/O performance.")
+    # ★ 新增参数
+    p.add_argument(
+        "--split-mode",
+        choices=["all", "per_subject"],
+        default=str(TRAIN_DEFAULTS.get("split_mode", "all")),
+        help=(
+            "Trial-level split strategy:\n"
+            "  'all'         — 全被试 trial 混合后随机分割（原始行为，跨被试泛化）\n"
+            "  'per_subject' — 每个被试独立做 trial-level 分割，再合并"
+            "（被试内泛化，无数据泄漏）"
+        ),
+    )
     args = p.parse_args()
 
     amp = bool(TRAIN_DEFAULTS["amp"])
@@ -116,8 +137,8 @@ def parse_args():
         model_type=args.model_type,
         val_ratio=args.val_ratio, test_ratio=args.test_ratio,
         mmap_cache_dir=args.mmap_cache_dir,
+        split_mode=args.split_mode,     # ★ 新增
     )
-
 
 if __name__ == "__main__":
     run_training(parse_args())

@@ -5,6 +5,10 @@
 - ICA 默认关闭且不在主 Pipeline 中使用
 - 预处理输出为 per-subject .npz (20 个文件)，回写到 ModelScope 数据集
 - 训练从 .npz 文件加载
+
+更新 (2026-05-28):
+- 新增 split_mode 参数，支持 "all"（全被试混合 trial-level 分割，原始行为）
+  和 "per_subject"（每个被试独立 trial-level 分割，再合并）
 """
 from __future__ import annotations
 from typing import Dict
@@ -13,17 +17,17 @@ from typing import Dict
 # Preprocessing
 # --------------------------------------------------------------------------
 PREPROCESS_DEFAULTS: Dict[str, object] = {
-    "fs": 200,                      # SEED-VII EEG_preprocessed 已 200Hz
-    "window_seconds": 4.0,          # 4 秒窗口
-    "step_seconds": 2.0,            # 50% 重叠
-    "middle_ratio": 0.6,            # 每个 trial 取居中 60%
-    "max_windows_per_trial": 60,    # 防长视频主导：每 clip 至多 N 个窗口
-    "use_car": True,                # 平均参考
-    "use_baseline_correct": True,   # 基线去均值
-    "use_ica": False,               # ICA — 关闭，不在主 Pipeline 中使用
+    "fs": 200,                     # SEED-VII EEG_preprocessed 已 200Hz
+    "window_seconds": 4.0,         # 4 秒窗口
+    "step_seconds": 2.0,           # 50% 重叠
+    "middle_ratio": 0.6,           # 每个 trial 取居中 60%
+    "max_windows_per_trial": 60,   # 防长视频主导：每 clip 至多 N 个窗口
+    "use_car": True,               # 平均参考
+    "use_baseline_correct": True,  # 基线去均值
+    "use_ica": False,              # ICA — 关闭，不在主 Pipeline 中使用
     "ica_components": 20,
     "ica_remove": 5,
-    "per_channel_zscore": True,     # 按通道 z-score（优先方案）
+    "per_channel_zscore": True,    # 按通道 z-score（优先方案）
     "eps": 1e-8,
     "save_float32": True,
 }
@@ -33,13 +37,13 @@ PREPROCESS_DEFAULTS: Dict[str, object] = {
 # --------------------------------------------------------------------------
 EEGNET_CONFIG: Dict[str, object] = {
     "n_channels": 62,
-    "n_timepoints": 800,            # 4s * 200Hz
-    "n_classes": 7,                 # SEED-VII 7 类情绪
-    "F1": 8,                        # 时间滤波器数量
-    "D": 2,                         # 深度乘子
-    "F2": 16,                       # 通常 F2 = F1 * D
-    "kernLength": 100,              # 200Hz raw EEG，0.5秒感受野
-    "dropout": 0.5,                 # 跨被试建议 0.5；被试内可 0.25
+    "n_timepoints": 800,           # 4s * 200Hz
+    "n_classes": 7,                # SEED-VII 7 类情绪
+    "F1": 8,                       # 时间滤波器数量
+    "D": 2,                        # 深度乘子
+    "F2": 16,                      # 通常 F2 = F1 * D
+    "kernLength": 100,             # 200Hz raw EEG，0.5秒感受野
+    "dropout": 0.5,                # 跨被试建议 0.5；被试内可 0.25
     "intensity_head_hidden": 64,
 }
 
@@ -107,7 +111,11 @@ TRAIN_DEFAULTS: Dict[str, object] = {
     "sample_weight_mode": "continuous",
     "intensity_threshold": 0.5,
     "weak_sample_weight": 0.1,
-    # 划分
+    # ★ 分割模式
+    # "all"        : 全被试 trial 混合后随机分割（原始行为，跨被试泛化）
+    # "per_subject": 每个被试独立 trial-level 分割，再合并（被试内泛化）
+    "split_mode": "all",
+    # 划分比例
     "val_ratio": 0.1,
     "test_ratio": 0.1,
     "split_unit": "trial",
@@ -121,7 +129,7 @@ TRAIN_DEFAULTS: Dict[str, object] = {
     "pin_memory": False,
     "persistent_workers": False,
     # 模型选择 — 默认 EEGNet
-    "model_type": "eegnet",         # ["eegnet", "conformer"]
+    "model_type": "eegnet",        # ["eegnet", "conformer"]
     # 被试筛选
     "train_subjects": "",
     "val_subjects": "",
@@ -134,4 +142,4 @@ TRAIN_DEFAULTS: Dict[str, object] = {
 # ModelScope 数据集
 # --------------------------------------------------------------------------
 MODELSCOPE_DATASET_ID = "DEREKVERSE/SEED-VII"
-NPZ_REPO_PREFIX = "preprocessed_npz"       # npz 文件在 dataset repo 中的路径前缀
+NPZ_REPO_PREFIX = "preprocessed_npz"   # npz 文件在 dataset repo 中的路径前缀

@@ -5,7 +5,9 @@
 - Pass 1 (轻量)：只扫描 y/s/meta（总计 < 50MB），构建全局索引
 - Pass 2 (懒加载)：将每个 npz 的 X 解压为独立 .npy，用 np.memmap 打开
   → 内存占用 ≈ 0（由 OS 页面缓存按需管理）
-- 支持 trial-level 划分以避免数据泄漏
+- 支持两种 trial-level 划分策略，均避免数据泄漏：
+  * "all"   : 全被试混合后做 trial-level 分割（原始行为）
+  * "per_subject": 每个被试独立做 trial-level 分割，再合并（新功能）
 """
 from __future__ import annotations
 
@@ -25,7 +27,6 @@ from torch.utils.data import Dataset
 
 from .labels import EMOTION_TO_IDX, trial_field_to_session_trial, trial_id_to_emotion
 
-
 # --------------------------------------------------------------------------
 # 轻量扫描：只读 y / s / meta，不动 X
 # --------------------------------------------------------------------------
@@ -38,11 +39,11 @@ def scan_npz_metadata(
     """Scan all per-subject npz files, load ONLY y/s/meta (skip X).
 
     Returns:
-      npz_paths: list of Path (sorted)
-      y_all:     (N_total,) int64
-      s_all:     (N_total,) float32
-      meta_all:  list[dict], length N_total
-      file_map:  (N_total, 2) int64  — each row = (file_idx, local_idx)
+        npz_paths: list of Path (sorted)
+        y_all:     (N_total,) int64
+        s_all:     (N_total,) float32
+        meta_all:  list[dict], length N_total
+        file_map:  (N_total, 2) int64 — each row = (file_idx, local_idx)
     """
     d = Path(npz_dir)
     if subjects:
@@ -86,7 +87,6 @@ def scan_npz_metadata(
           f"y/s/meta RAM ≈ {(y_all.nbytes + s_all.nbytes + file_map.nbytes) / 1024**2:.1f} MB")
 
     return paths, y_all, s_all, meta_all, file_map
-
 
 # --------------------------------------------------------------------------
 # Memmap-backed X array: 解压 npz → .npy → memmap
@@ -137,7 +137,7 @@ class MmapXStore:
 
     def get(self, file_idx: int, local_idx: int) -> np.ndarray:
         """Read one window: returns a WRITABLE (62, 800) float32 copy."""
-        # .copy() 确保：1) 可写  2) contiguous  3) 脱离 memmap 页锁定
+        # .copy() 确保：1) 可写 2) contiguous 3) 脱离 memmap 页锁定
         return self._mmaps[file_idx][local_idx].copy()
 
     def close(self):
@@ -154,7 +154,6 @@ class MmapXStore:
         except Exception:
             pass
 
-
 # --------------------------------------------------------------------------
 # OOM-safe Dataset: memmap-backed
 # --------------------------------------------------------------------------
@@ -169,9 +168,9 @@ class EEGMmapDataset(Dataset):
     def __init__(
         self,
         x_store: MmapXStore,
-        file_map: np.ndarray,       # (N, 2) int64: (file_idx, local_idx)
-        y: np.ndarray,              # (N,) int64
-        s: np.ndarray,              # (N,) float32
+        file_map: np.ndarray,   # (N, 2) int64: (file_idx, local_idx)
+        y: np.ndarray,           # (N,) int64
+        s: np.ndarray,           # (N,) float32
         indices: Optional[np.ndarray] = None,
     ):
         self.x_store = x_store
@@ -187,11 +186,10 @@ class EEGMmapDataset(Dataset):
         i = self.indices[idx]
         fi, li = int(self.file_map[i, 0]), int(self.file_map[i, 1])
         # x_store.get() 已经返回 .copy()，可写 + contiguous
-        x = self.x_store.get(fi, li)                          # (62, 800) float32, writable
-        x_t = torch.from_numpy(x).unsqueeze(0)                # (1, 62, 800)
+        x = self.x_store.get(fi, li)          # (62, 800) float32, writable
+        x_t = torch.from_numpy(x).unsqueeze(0)  # (1, 62, 800)
         return x_t, torch.tensor(self.y[i], dtype=torch.long), \
                torch.tensor(self.s[i], dtype=torch.float32)
-
 
 # --------------------------------------------------------------------------
 # 兼容的小规模 in-memory Dataset（单被试调试用）
@@ -214,9 +212,8 @@ class EEGWindowArrayDataset(Dataset):
         i = self.indices[idx]
         return self.X[i].unsqueeze(0), self.y[i], self.s[i]
 
-
 # --------------------------------------------------------------------------
-# Trial-level split
+# Trial-level split（全被试混合，原始行为）
 # --------------------------------------------------------------------------
 
 @dataclass
@@ -237,6 +234,9 @@ def split_trials_from_meta(
 ) -> Dict[str, np.ndarray]:
     """Split window indices by trial membership to avoid data leakage.
 
+    策略：全被试所有 trial 混合后随机分割（原始行为）。
+    对于跨被试泛化场景，该方式使验证/测试集包含所有被试的 trials。
+
     Returns dict with keys 'train', 'val', 'test' -> np.ndarray of window indices.
     """
     trial_to_windows: Dict[Tuple[str, int, int], List[int]] = {}
@@ -254,15 +254,15 @@ def split_trials_from_meta(
     rng.shuffle(indices)
 
     n_test = max(1, int(round(n * test_ratio)))
-    n_val = max(1, int(round(n * val_ratio)))
+    n_val  = max(1, int(round(n * val_ratio)))
 
-    test_trial_idx = indices[:n_test]
-    val_trial_idx = indices[n_test:n_test + n_val]
+    test_trial_idx  = indices[:n_test]
+    val_trial_idx   = indices[n_test:n_test + n_val]
     train_trial_idx = indices[n_test + n_val:]
 
     result: Dict[str, List[int]] = {"train": [], "val": [], "test": []}
-    for split_name, trial_idx_arr in [("test", test_trial_idx),
-                                       ("val", val_trial_idx),
+    for split_name, trial_idx_arr in [("test",  test_trial_idx),
+                                       ("val",   val_trial_idx),
                                        ("train", train_trial_idx)]:
         for ti in trial_idx_arr:
             tk = trial_keys[ti]
@@ -270,6 +270,118 @@ def split_trials_from_meta(
 
     return {k: np.array(sorted(v), dtype=np.int64) for k, v in result.items()}
 
+
+# --------------------------------------------------------------------------
+# ★ 新功能：Per-subject trial-level split（单被试独立分割）
+# --------------------------------------------------------------------------
+
+def split_trials_per_subject(
+    meta: list,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    seed: int = 42,
+) -> Dict[str, np.ndarray]:
+    """Split window indices by trial membership, **per subject independently**.
+
+    策略：
+      1. 对每个被试，枚举其所有 (session_id, trial_id) 组成的 trial 集合。
+      2. 在该被试内做 trial-level 随机分割（比例 val_ratio / test_ratio）。
+      3. 各被试的 train/val/test 窗口索引分别合并，返回全局索引数组。
+
+    优势（vs 全被试混合分割）：
+      - 每个被试的 val/test 都包含该被试独有的留出 trials，
+        可评估模型在同一被试内的泛化（被试内验证场景）。
+      - 严格无数据泄漏：同一 trial 的所有窗口只出现在一个 split 中。
+      - 保证每个被试在训练集都有代表，适合被试内编码器训练。
+
+    Returns dict with keys 'train', 'val', 'test' -> np.ndarray of window indices.
+    """
+    # Step 1: 按被试收集 trial → window 索引映射
+    # subject → { (session_id, trial_id) → [window_idx, ...] }
+    subj_trial_map: Dict[str, Dict[Tuple[int, int], List[int]]] = {}
+    for i, m in enumerate(meta):
+        subj = str(m["subject"])
+        st_key = (int(m["session_id"]), int(m["trial_id"]))
+        if subj not in subj_trial_map:
+            subj_trial_map[subj] = {}
+        if st_key not in subj_trial_map[subj]:
+            subj_trial_map[subj][st_key] = []
+        subj_trial_map[subj][st_key].append(i)
+
+    result: Dict[str, List[int]] = {"train": [], "val": [], "test": []}
+    subj_stats: List[Dict] = []
+
+    for subj_idx, (subj, trial_map) in enumerate(sorted(subj_trial_map.items())):
+        trial_keys = list(trial_map.keys())
+        n = len(trial_keys)
+
+        # 每个被试使用独立但可重现的随机种子（seed + subj_hash 保证可重现性）
+        subj_seed = seed + hash(subj) % (2**31)
+        rng = np.random.default_rng(subj_seed)
+        perm = np.arange(n)
+        rng.shuffle(perm)
+
+        n_test = max(1, int(round(n * test_ratio)))
+        n_val  = max(1, int(round(n * val_ratio)))
+        # 保证 train 至少有 1 个 trial
+        n_train = n - n_test - n_val
+        if n_train < 1:
+            # 极少 trial 情况：强制保留至少 1 个 trial 给 train
+            n_test = max(0, n_test - 1)
+            n_val  = max(0, n_val - 1)
+            n_train = n - n_test - n_val
+            warnings.warn(
+                f"[PER-SUBJ SPLIT] Subject '{subj}' only has {n} trials; "
+                f"adjusted to train={n_train}, val={n_val}, test={n_test}.",
+                RuntimeWarning, stacklevel=2,
+            )
+
+        test_idx_local  = perm[:n_test]
+        val_idx_local   = perm[n_test:n_test + n_val]
+        train_idx_local = perm[n_test + n_val:]
+
+        counts = {"train": 0, "val": 0, "test": 0}
+        for split_name, local_arr in [("test",  test_idx_local),
+                                       ("val",   val_idx_local),
+                                       ("train", train_idx_local)]:
+            for ti in local_arr:
+                tk = trial_keys[ti]
+                wins = trial_map[tk]
+                result[split_name].extend(wins)
+                counts[split_name] += len(wins)
+
+        subj_stats.append({
+            "subject": subj,
+            "n_trials": n,
+            "n_trials_train": int(len(train_idx_local)),
+            "n_trials_val":   int(len(val_idx_local)),
+            "n_trials_test":  int(len(test_idx_local)),
+            "n_windows_train": counts["train"],
+            "n_windows_val":   counts["val"],
+            "n_windows_test":  counts["test"],
+        })
+
+    # 打印统计摘要
+    print("[PER-SUBJ SPLIT] Per-subject trial split summary:")
+    print(f"  {'Subject':>10} | {'Trials':>6} | {'Tr-tr':>5} | {'Val-tr':>6} | "
+          f"{'Tst-tr':>6} | {'Tr-win':>6} | {'Val-win':>7} | {'Tst-win':>7}")
+    for st in subj_stats:
+        print(f"  {st['subject']:>10} | {st['n_trials']:>6} | "
+              f"{st['n_trials_train']:>5} | {st['n_trials_val']:>6} | "
+              f"{st['n_trials_test']:>6} | {st['n_windows_train']:>6} | "
+              f"{st['n_windows_val']:>7} | {st['n_windows_test']:>7}")
+    total_tr  = sum(s["n_windows_train"] for s in subj_stats)
+    total_val = sum(s["n_windows_val"]   for s in subj_stats)
+    total_tst = sum(s["n_windows_test"]  for s in subj_stats)
+    print(f"  {'[TOTAL]':>10} | {'':>6} | {'':>5} | {'':>6} | {'':>6} | "
+          f"{total_tr:>6} | {total_val:>7} | {total_tst:>7}")
+
+    return {k: np.array(sorted(v), dtype=np.int64) for k, v in result.items()}
+
+
+# --------------------------------------------------------------------------
+# 辅助：按被试过滤窗口索引
+# --------------------------------------------------------------------------
 
 def filter_by_subjects(meta: list, subjects: List[str]) -> np.ndarray:
     """Return indices of windows whose subject is in the given list."""
@@ -288,7 +400,7 @@ class TrialData:
     session_id: int
     trial_id: int
     field_id: int
-    eeg: np.ndarray             # (62, T)
+    eeg: np.ndarray   # (62, T)
     emotion_code: str
     label_idx: int
 
@@ -314,8 +426,8 @@ def iter_trials_from_mat(mat_path: str) -> Iterator[TrialData]:
         for fid in field_ids:
             with h5py.File(mat_path, "r") as f:
                 eeg = np.array(f[str(fid)], dtype=np.float64)
-                if eeg.ndim == 2 and eeg.shape[0] != 62 and eeg.shape[1] == 62:
-                    eeg = eeg.T
+            if eeg.ndim == 2 and eeg.shape[0] != 62 and eeg.shape[1] == 62:
+                eeg = eeg.T
             sid, tid = trial_field_to_session_trial(fid)
             code = trial_id_to_emotion(sid, tid)
             yield TrialData(
